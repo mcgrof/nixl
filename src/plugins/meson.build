@@ -25,6 +25,14 @@ if enabled_plugins.get('POSIX')
     subdir('posix')
 endif
 
+if enabled_plugins.get('XNVME_KV')
+    if not xnvme_dep.found() and is_explicit_enable
+        error('XNVME_KV plugin requested but xnvme dependency not found')
+    elif xnvme_dep.found()
+        subdir('xnvme_kv')
+    endif
+endif
+
 if enabled_plugins.get('OBJ')
     subdir('obj')
 endif
