@@ -21,6 +21,12 @@ nixl_xnvme_kv_app = executable('nixl_xnvme_kv_test', 'nixl_xnvme_kv_test.cpp',
                                install: true)
 test('xnvme_kv_plugin_test', nixl_xnvme_kv_app, suite: ['unit', 'plugins', 'xnvme_kv'])
 
+# Focused benchmark (STORE/RETRIEVE/EXIST sweeps); same env gating.
+nixl_xnvme_kv_bench = executable('nixl_xnvme_kv_bench', 'nixl_xnvme_kv_bench.cpp',
+                                 dependencies: [nixl_dep, nixl_infra, absl_log_dep],
+                                 include_directories: [nixl_inc_dirs, utils_inc_dirs],
+                                 install: true)
+
 # CPU-only unit tests (mock device, no xNVMe library or KV hardware needed).
 gtest_dep = dependency('gtest', main: true, version: '>=1.11.0', required: false)
 if gtest_dep.found()

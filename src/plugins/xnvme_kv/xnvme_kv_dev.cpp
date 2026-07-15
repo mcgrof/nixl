@@ -83,6 +83,8 @@ public:
     void
     close() override {
         if (queue_) {
+            NIXL_INFO << "XNVME_KV: device stats: submitted=" << statSubmitted_
+                      << " saturation_retries=" << statSaturated_;
             int err = xnvme_queue_term(queue_);
             if (err)
                 NIXL_WARN << "XNVME_KV: xnvme_queue_term failed: " << strerror(-err);
@@ -192,8 +194,10 @@ private:
     submit(xnvmeKvOp op, const void *key, uint8_t key_len, void *buf, uint32_t len, void *cookie) {
         struct xnvme_cmd_ctx *ctx = xnvme_queue_get_cmd_ctx(queue_);
 
-        if (!ctx)
+        if (!ctx) {
+            statSaturated_++;
             return -EAGAIN;
+        }
 
         // Pooled contexts come back with the previous command intact; the
         // xnvme_kvs_* setters do not cover every dword (e.g. an Exist after
@@ -219,10 +223,13 @@ private:
             xnvme_queue_put_cmd_ctx(queue_, ctx);
             // Normalize both saturation signals (-EBUSY: in-flight == capacity,
             // -EAGAIN: no SQE available) to the single retry-later code.
-            if (err == -EBUSY || err == -EAGAIN)
+            if (err == -EBUSY || err == -EAGAIN) {
+                statSaturated_++;
                 return -EAGAIN;
+            }
             return err;
         }
+        statSubmitted_++;
         return 0;
     }
 
@@ -248,6 +255,8 @@ private:
     struct xnvme_dev *dev_ = nullptr;
     struct xnvme_queue *queue_ = nullptr;
     nixlXnvmeKvCplCb cplCb_;
+    uint64_t statSubmitted_ = 0;
+    uint64_t statSaturated_ = 0;
     uint32_t nsid_ = 0;
     uint16_t maxKeyLen_ = 0;
     uint32_t maxValueLen_ = 0;
