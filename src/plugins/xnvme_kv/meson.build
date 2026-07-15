@@ -19,6 +19,8 @@ xnvme_kv_backend_sources = files(
     'xnvme_kv_backend.cpp',
     'xnvme_kv_backend.h',
     'xnvme_kv_dev.h',
+    'xnvme_kv_progress_engine.cpp',
+    'xnvme_kv_progress_engine.h',
 )
 
 xnvme_kv_sources = [

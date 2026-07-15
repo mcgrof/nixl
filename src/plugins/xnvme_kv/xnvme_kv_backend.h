@@ -126,6 +126,8 @@ private:
     std::vector<nixlXnvmeKvTaskContext> taskContexts_;
 };
 
+class nixlXnvmeKvProgressEngine;
+
 class nixlXnvmeKvEngine : public nixlBackendEngine {
 public:
     explicit nixlXnvmeKvEngine(const nixlBackendInitParams *init_params)
@@ -228,10 +230,19 @@ private:
     nixl_status_t
     initDevice();
 
+    nixl_status_t
+    createProgressEngine(bool enable_prog_thread, uint64_t pthr_delay_us);
+
     static constexpr uint32_t kDefaultNumTasks = 128;
     static constexpr const char *kDefaultBe = "io_uring_cmd";
 
     std::unique_ptr<nixlXnvmeKvDevIface> dev_;
+    std::unique_ptr<nixlXnvmeKvProgressEngine> progressEngine_;
+    // Raw view of progressEngine_ for the device completion callback: it
+    // stays valid while the progress-engine destructor drains in-flight
+    // commands, when the unique_ptr already reads null (reset() nulls the
+    // stored pointer before destroying the object).
+    nixlXnvmeKvProgressEngine *progressEnginePtr_ = nullptr;
 
     std::string deviceName_;
     std::string be_ = kDefaultBe;

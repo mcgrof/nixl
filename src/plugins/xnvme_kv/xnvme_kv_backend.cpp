@@ -22,6 +22,7 @@
 #include <stdexcept>
 
 #include "common/nixl_log.h"
+#include "xnvme_kv_progress_engine.h"
 
 namespace {
 
@@ -131,6 +132,12 @@ nixlXnvmeKvEngine::nixlXnvmeKvEngine(const nixlBackendInitParams *init_params,
     if (status != NIXL_SUCCESS)
         throw std::runtime_error("XNVME_KV: device initialization failed");
 
+    status = createProgressEngine(init_params->enableProgTh, init_params->pthrDelay);
+    if (status != NIXL_SUCCESS) {
+        dev_->close();
+        throw std::runtime_error("XNVME_KV: progress engine initialization failed");
+    }
+
     NIXL_INFO << "XNVME_KV: initialized device_name=" << deviceName_ << " be=" << be_
               << " nsid=" << dev_->nsid() << " num_tasks=" << numTasks_
               << " max_key_len=" << dev_->maxKeyLen() << " max_value_len=" << dev_->maxValueLen()
@@ -140,6 +147,11 @@ nixlXnvmeKvEngine::nixlXnvmeKvEngine(const nixlBackendInitParams *init_params,
 }
 
 nixlXnvmeKvEngine::~nixlXnvmeKvEngine() {
+    // The progress engine drains in-flight commands before the device and
+    // queue go away; completions reaped during that drain still route
+    // through progressEnginePtr_.
+    progressEngine_.reset();
+    progressEnginePtr_ = nullptr;
     if (dev_)
         dev_->close();
 }
@@ -244,10 +256,14 @@ nixlXnvmeKvEngine::parseInitParams(const nixl_b_params_t *custom_params) {
 
 nixl_status_t
 nixlXnvmeKvEngine::initDevice() {
-    // The async data path lands with the progress engine; completions are
-    // not routed anywhere yet.
-    nixl_status_t status = dev_->open(deviceName_, be_, nsid_, numTasks_,
-                                      [](void *cookie, const nixlXnvmeKvCpl &cpl) {});
+    nixl_status_t status = dev_->open(
+        deviceName_, be_, nsid_, numTasks_, [this](void *cookie, const nixlXnvmeKvCpl &cpl) {
+            // progressEnginePtr_, not the unique_ptr: during the engine
+            // destructor's drain the unique_ptr already reads null while the
+            // progress-engine object is still alive inside its destructor.
+            if (progressEnginePtr_)
+                progressEnginePtr_->onCompletion(cookie, cpl);
+        });
     if (status != NIXL_SUCCESS)
         return status;
 
@@ -273,6 +289,21 @@ nixlXnvmeKvEngine::initDevice() {
         }
     }
 
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlXnvmeKvEngine::createProgressEngine(bool enable_prog_thread, uint64_t pthr_delay_us) {
+    if (enable_prog_thread) {
+        if (pthr_delay_us == 0)
+            NIXL_WARN << "XNVME_KV: progress-thread delay is 0us; thread will busy-spin";
+        progressEngine_ = std::make_unique<nixlXnvmeKvThreadedEngine>(
+            dev_.get(), ignoreReadNotFound_, std::chrono::microseconds(pthr_delay_us));
+    } else {
+        progressEngine_ =
+            std::make_unique<nixlXnvmeKvNoThreadEngine>(dev_.get(), ignoreReadNotFound_);
+    }
+    progressEnginePtr_ = progressEngine_.get();
     return NIXL_SUCCESS;
 }
 
@@ -323,8 +354,7 @@ nixlXnvmeKvEngine::queryMem(const nixl_reg_dlist_t &descs,
             resp.emplace_back(nixl_b_params_t{});
         return NIXL_SUCCESS;
     }
-    NIXL_ERROR << "XNVME_KV: query_mem_mode=actual not implemented yet";
-    return NIXL_ERR_NOT_SUPPORTED;
+    return progressEngine_->queryMem(descs, resp);
 }
 
 nixl_status_t
@@ -334,8 +364,43 @@ nixlXnvmeKvEngine::prepXfer(const nixl_xfer_op_t &operation,
                             const std::string &remote_agent,
                             nixlBackendReqH *&handle,
                             const nixl_opt_b_args_t *opt_args) const {
-    NIXL_ERROR << "XNVME_KV: transfer data path not implemented yet";
-    return NIXL_ERR_NOT_SUPPORTED;
+    if (!isValidPrepXferParams(operation, local, remote, remote_agent, localAgent))
+        return NIXL_ERR_INVALID_PARAM;
+
+    const int desc_count = local.descCount();
+    if (desc_count == 0) {
+        NIXL_ERROR << "XNVME_KV: empty descriptor list";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    if (remote.descCount() != desc_count) {
+        NIXL_ERROR << "XNVME_KV: local (" << desc_count << ") and remote (" << remote.descCount()
+                   << ") descriptor counts differ";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    auto req_h = std::make_unique<nixlXnvmeKvBackendReqH>(desc_count);
+    req_h->storedOperation_ = operation;
+    if (operation == NIXL_READ)
+        req_h->ignoreNotFound_ = ignoreReadNotFound_;
+
+    req_h->valueIovecs_.resize(desc_count);
+    req_h->taskContexts_.resize(desc_count);
+    req_h->objectKeys_.reserve(desc_count);
+
+    for (int i = 0; i < desc_count; i++) {
+        req_h->valueIovecs_[i].iov_base = reinterpret_cast<void *>(local[i].addr);
+        req_h->valueIovecs_[i].iov_len = local[i].len;
+
+        const auto *kv_md = static_cast<const nixlXnvmeKvMetadata *>(remote[i].metadataP);
+        if (!kv_md) {
+            NIXL_ERROR << "XNVME_KV: remote descriptor " << i << " has no registration metadata";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        req_h->objectKeys_.push_back(kv_md->objKey);
+    }
+
+    handle = req_h.release();
+    return NIXL_SUCCESS;
 }
 
 nixl_status_t
@@ -345,16 +410,28 @@ nixlXnvmeKvEngine::postXfer(const nixl_xfer_op_t &operation,
                             const std::string &remote_agent,
                             nixlBackendReqH *&handle,
                             const nixl_opt_b_args_t *opt_args) const {
-    NIXL_ERROR << "XNVME_KV: transfer data path not implemented yet";
-    return NIXL_ERR_NOT_SUPPORTED;
+    if (!handle) {
+        NIXL_ERROR << "XNVME_KV: postXfer on null handle";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    if (operation != NIXL_WRITE && operation != NIXL_READ) {
+        NIXL_ERROR << "XNVME_KV: unsupported operation";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    return progressEngine_->postXfer(static_cast<nixlXnvmeKvBackendReqH *>(handle), operation);
 }
 
 nixl_status_t
 nixlXnvmeKvEngine::checkXfer(nixlBackendReqH *handle) const {
-    return NIXL_ERR_NOT_SUPPORTED;
+    return progressEngine_->checkXfer(static_cast<nixlXnvmeKvBackendReqH *>(handle));
 }
 
 nixl_status_t
 nixlXnvmeKvEngine::releaseReqH(nixlBackendReqH *handle) const {
-    return NIXL_ERR_NOT_SUPPORTED;
+    if (!handle) {
+        NIXL_ERROR << "XNVME_KV: releaseReqH on null handle";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    progressEngine_->cancelRequest(static_cast<nixlXnvmeKvBackendReqH *>(handle));
+    return NIXL_SUCCESS;
 }
