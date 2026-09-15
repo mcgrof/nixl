@@ -840,6 +840,10 @@ void nixlPluginManager::registerBuiltinPlugins() {
     NIXL_REGISTER_STATIC_PLUGIN(Backend, POSIX)
 #endif
 
+#ifdef STATIC_PLUGIN_XNVME_NVM
+    NIXL_REGISTER_STATIC_PLUGIN(Backend, XNVME_NVM)
+#endif
+
 #ifdef STATIC_PLUGIN_GPUNETIO
     NIXL_REGISTER_STATIC_PLUGIN(Backend, GPUNETIO)
 #endif
