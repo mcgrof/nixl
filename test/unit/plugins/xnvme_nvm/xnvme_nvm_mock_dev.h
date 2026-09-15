@@ -20,6 +20,8 @@
 #include <cerrno>
 #include <cstring>
 #include <deque>
+#include <map>
+#include <set>
 #include <vector>
 
 #include "xnvme_nvm_dev.h"
@@ -37,7 +39,10 @@ public:
     uint32_t idfyMdtsBytes = 0;
     uint32_t sysfsMaxHwBytes = 0;
     uint32_t sysfsMaxSegments = 0;
+    uint32_t sysfsMaxHwDmabufBytes = 0;
     uint32_t pageBytes = 4096;
+    bool registration = false; // advertise registered-buffer support
+    uint32_t maxSlots = 8;
     std::string serial = "MOCK0";
     std::string wwid = "mock.wwid.0";
     bool reportsBytes = false; // true mimics the io_uring/libaio bio paths
@@ -57,6 +62,14 @@ public:
     // --- observability ---
     std::vector<uint8_t> store;
     std::vector<std::pair<uint64_t, uint16_t>> submitted; // (slba, nlb) in order
+    std::vector<uint32_t> submittedSlots; // slot per submitted command
+    // Registered buffers: slot -> (base, len); a dma-buf slot's base is the
+    // memory a test declares for that fd in dmabufBacking.
+    std::map<uint32_t, std::pair<uint8_t *, size_t>> slots;
+    std::map<int, uint8_t *> dmabufBacking;
+    std::set<uint32_t> dmabufSlots; // slots that take offsets, not addresses
+    int registerCalls = 0;
+    int unregisterCalls = 0;
     int submitAttempts = 0;
     int submitAccepted = 0;
     int pokeCount = 0;
@@ -79,6 +92,7 @@ public:
         geo_.xnvmeMdtsBytes = idfyMdtsBytes;
         geo_.sysfsMaxHwBytes = sysfsMaxHwBytes;
         geo_.sysfsMaxSegments = sysfsMaxSegments;
+        geo_.sysfsMaxHwDmabufBytes = sysfsMaxHwDmabufBytes;
         geo_.pageBytes = pageBytes;
         geo_.serial = serial;
         geo_.model = "mock";
@@ -105,14 +119,51 @@ public:
         return reportsBytes;
     }
 
-    int
-    submitRead(uint64_t slba, uint16_t nlb, void *buf, void *cookie) override {
-        return enqueue(true, slba, nlb, buf, cookie);
+    bool
+    supportsRegistration() const override {
+        return registration;
     }
 
     int
-    submitWrite(uint64_t slba, uint16_t nlb, const void *buf, void *cookie) override {
-        return enqueue(false, slba, nlb, const_cast<void *>(buf), cookie);
+    registerHostBuffer(void *addr, size_t len, uint32_t &slot) override {
+        if (!registration) {
+            return -ENOTSUP;
+        }
+        return addSlot(static_cast<uint8_t *>(addr), len, slot);
+    }
+
+    int
+    registerDmabuf(int fd, size_t len, uint32_t &slot) override {
+        if (!registration) {
+            return -ENOTSUP;
+        }
+        auto it = dmabufBacking.find(fd);
+        if (it == dmabufBacking.end()) {
+            return -EBADF;
+        }
+        int rc = addSlot(it->second, len, slot);
+        if (rc == 0) {
+            dmabufSlots.insert(slot);
+        }
+        return rc;
+    }
+
+    int
+    unregisterBuffer(uint32_t slot) override {
+        unregisterCalls++;
+        dmabufSlots.erase(slot);
+        return slots.erase(slot) ? 0 : -ENOENT;
+    }
+
+    int
+    submitRead(uint64_t slba, uint16_t nlb, void *buf, uint32_t slot, void *cookie) override {
+        return enqueue(true, slba, nlb, buf, slot, cookie);
+    }
+
+    int
+    submitWrite(uint64_t slba, uint16_t nlb, const void *buf, uint32_t slot, void *cookie)
+        override {
+        return enqueue(false, slba, nlb, const_cast<void *>(buf), slot, cookie);
     }
 
     int
@@ -142,11 +193,58 @@ private:
         uint64_t slba;
         uint16_t nlb;
         void *buf;
+        uint32_t slot;
         void *cookie;
     };
 
     int
-    enqueue(bool read, uint64_t slba, uint16_t nlb, void *buf, void *cookie) {
+    addSlot(uint8_t *base, size_t len, uint32_t &slot) {
+        registerCalls++;
+        for (uint32_t s = 0; s < maxSlots; s++) {
+            if (!slots.count(s)) {
+                slots[s] = {base, len};
+                slot = s;
+                return 0;
+            }
+        }
+        return -ENOSPC;
+    }
+
+    // Where a command's bytes live: a plain pointer, a pointer inside a
+    // registered host buffer, or an offset inside a registered dma-buf.
+    uint8_t *
+    resolve(const pendingCmd &cmd, bool &ok) {
+        ok = true;
+        if (cmd.slot == XNVME_NVM_NO_SLOT) {
+            return static_cast<uint8_t *>(cmd.buf);
+        }
+        auto it = slots.find(cmd.slot);
+        if (it == slots.end()) {
+            ok = false;
+            return nullptr;
+        }
+        const auto [base, len] = it->second;
+        const auto raw = reinterpret_cast<uintptr_t>(cmd.buf);
+        const auto lo = reinterpret_cast<uintptr_t>(base);
+        // A dma-buf slot must carry a byte offset inside the buffer; a host
+        // slot must carry an address inside its registered range. Anything
+        // else is a backend bug and fails the command.
+        if (dmabufSlots.count(cmd.slot)) {
+            if (raw >= len) {
+                ok = false;
+                return nullptr;
+            }
+            return base + raw;
+        }
+        if (raw < lo || raw >= lo + len) {
+            ok = false;
+            return nullptr;
+        }
+        return static_cast<uint8_t *>(cmd.buf);
+    }
+
+    int
+    enqueue(bool read, uint64_t slba, uint16_t nlb, void *buf, uint32_t slot, void *cookie) {
         submitAttempts++;
         if (eagainBudget > 0) {
             eagainBudget--;
@@ -158,8 +256,9 @@ private:
         if (inflight_.size() >= capacity) {
             return -EAGAIN;
         }
-        inflight_.push_back({read, slba, nlb, buf, cookie});
+        inflight_.push_back({read, slba, nlb, buf, slot, cookie});
         submitted.emplace_back(slba, nlb);
+        submittedSlots.push_back(slot);
         submitAccepted++;
         return 0;
     }
@@ -182,10 +281,18 @@ private:
             cplCb_(cmd.cookie, cpl);
             return;
         }
+        bool ok = true;
+        uint8_t *mem = resolve(cmd, ok);
+        if (!ok) {
+            cpl.sc = 0x02; // Invalid Field: unknown slot
+            cpl.sct = 0;
+            cplCb_(cmd.cookie, cpl);
+            return;
+        }
         if (cmd.read) {
-            memcpy(cmd.buf, store.data() + offset, bytes);
+            memcpy(mem, store.data() + offset, bytes);
         } else {
-            memcpy(store.data() + offset, cmd.buf, bytes);
+            memcpy(store.data() + offset, mem, bytes);
         }
         if (reportsBytes) {
             cpl.result =

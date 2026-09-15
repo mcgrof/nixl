@@ -17,12 +17,16 @@
 #ifndef XNVME_NVM_DEV_H
 #define XNVME_NVM_DEV_H
 
+#include <cerrno>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 
 #include "nixl_types.h"
+
+// A command that names no registered buffer.
+inline constexpr uint32_t XNVME_NVM_NO_SLOT = UINT32_MAX;
 
 // Narrow seam over one xNVMe device plus its async queue for conventional
 // NVM reads and writes. The backend and progress engine only talk to this
@@ -53,6 +57,7 @@ struct nixlXnvmeNvmGeo {
     uint32_t xnvmeMdtsBytes = 0; // xNVMe's own geo.mdts_nbytes, for the record
     uint32_t sysfsMaxHwBytes = 0; // queue/max_hw_sectors_kb * 1024; 0 = unknown
     uint32_t sysfsMaxSegments = 0; // queue/max_segments; 0 = unknown
+    uint32_t sysfsMaxHwDmabufBytes = 0; // queue/max_hw_dmabuf_sectors_kb * 1024; 0 = absent
     uint32_t pageBytes = 0; // host page size, the unit of a scattered user buffer
     std::string serial;
     std::string model;
@@ -106,15 +111,40 @@ public:
     virtual bool
     completionReportsBytes() const = 0;
 
-    // Submit one read or write of nlb + 1 logical blocks at slba. Returns 0
-    // on successful submission, -EAGAIN when the queue is saturated (no
-    // command context, SQ full, or in-flight == capacity) so the caller must
-    // poke() and retry, or another negative errno on permanent failure.
-    virtual int
-    submitRead(uint64_t slba, uint16_t nlb, void *buf, void *cookie) = 0;
+    // Registered buffers. A device that supports them hands out slot
+    // indices; a command then names the slot and, in buf, either the
+    // virtual address inside a registered host buffer or the byte offset
+    // inside a registered dma-buf. The xNVMe device supports neither.
+    virtual bool
+    supportsRegistration() const {
+        return false;
+    }
 
     virtual int
-    submitWrite(uint64_t slba, uint16_t nlb, const void *buf, void *cookie) = 0;
+    registerHostBuffer(void *addr, size_t len, uint32_t &slot) {
+        return -ENOTSUP;
+    }
+
+    virtual int
+    registerDmabuf(int fd, size_t len, uint32_t &slot) {
+        return -ENOTSUP;
+    }
+
+    virtual int
+    unregisterBuffer(uint32_t slot) {
+        return -ENOTSUP;
+    }
+
+    // Submit one read or write of nlb + 1 logical blocks at slba. slot is
+    // XNVME_NVM_NO_SLOT for a plain host pointer. Returns 0 on successful
+    // submission, -EAGAIN when the queue is saturated (no command context,
+    // SQ full, or in-flight == capacity) so the caller must poke() and
+    // retry, or another negative errno on permanent failure.
+    virtual int
+    submitRead(uint64_t slba, uint16_t nlb, void *buf, uint32_t slot, void *cookie) = 0;
+
+    virtual int
+    submitWrite(uint64_t slba, uint16_t nlb, const void *buf, uint32_t slot, void *cookie) = 0;
 
     // Reap completions, firing cpl_cb inline for each. xNVMe defers ring
     // submission to poke by default, so progress requires poking even when
@@ -127,8 +157,23 @@ public:
     outstanding() const = 0;
 };
 
+// sysfs helpers shared by both device implementations (xnvme_nvm_dev.cpp).
+namespace nixl_xnvme_nvm {
+std::string
+readSysfs(const std::string &path);
+unsigned long
+readSysfsNumber(const std::string &path);
+bool
+sysfsNamesFor(const std::string &uri, std::string &ctrl, std::string &ns);
+} // namespace nixl_xnvme_nvm
+
 // Real xNVMe-backed implementation (xnvme_nvm_dev.cpp).
 std::unique_ptr<nixlXnvmeNvmDevIface>
 nixlXnvmeNvmDevCreate();
+
+// liburing implementation for registered host and dma-buf buffers on a
+// block device or file (xnvme_nvm_uring_dev.cpp).
+std::unique_ptr<nixlXnvmeNvmDevIface>
+nixlXnvmeNvmUringDevCreate();
 
 #endif // XNVME_NVM_DEV_H

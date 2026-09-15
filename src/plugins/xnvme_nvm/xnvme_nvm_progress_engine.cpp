@@ -143,8 +143,8 @@ nixlXnvmeNvmProgressEngine::trySubmitRequest(nixlXnvmeNvmBackendReqH *req_h) con
 
     for (uint32_t t = req_h->nextTask_; t < total; t++) {
         nixlXnvmeNvmTask *task = &req_h->tasks_[t];
-        int err = is_read ? dev_->submitRead(task->slba, task->nlb, task->buf, task) :
-                            dev_->submitWrite(task->slba, task->nlb, task->buf, task);
+        int err = is_read ? dev_->submitRead(task->slba, task->nlb, task->buf, task->slot, task) :
+                            dev_->submitWrite(task->slba, task->nlb, task->buf, task->slot, task);
         if (err == -EAGAIN) {
             stats_.submitParked++;
             req_h->nextTask_ = t;

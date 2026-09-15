@@ -26,7 +26,7 @@
 
 #include "common/nixl_log.h"
 
-namespace {
+namespace nixl_xnvme_nvm {
 
 std::string
 readSysfs(const std::string &path) {
@@ -70,6 +70,14 @@ sysfsNamesFor(const std::string &uri, std::string &ctrl, std::string &ns) {
     }
     return false;
 }
+
+} // namespace nixl_xnvme_nvm
+
+namespace {
+
+using nixl_xnvme_nvm::readSysfs;
+using nixl_xnvme_nvm::readSysfsNumber;
+using nixl_xnvme_nvm::sysfsNamesFor;
 
 enum class devKind { unknown, nvmeNamespace, nvmeController, blockDevice, fsFile };
 
@@ -203,6 +211,10 @@ public:
             if (segs && segs < (1ul << 20)) {
                 geo_.sysfsMaxSegments = static_cast<uint32_t>(segs);
             }
+            const unsigned long dkb = readSysfsNumber(qdir + "max_hw_dmabuf_sectors_kb");
+            if (dkb && dkb < (1ul << 22)) {
+                geo_.sysfsMaxHwDmabufBytes = static_cast<uint32_t>(dkb) * 1024u;
+            }
         }
 
         int err = xnvme_queue_init(dev_, opts.numTasks, 0, &queue_);
@@ -246,12 +258,19 @@ public:
     }
 
     int
-    submitRead(uint64_t slba, uint16_t nlb, void *buf, void *cookie) override {
+    submitRead(uint64_t slba, uint16_t nlb, void *buf, uint32_t slot, void *cookie) override {
+        if (slot != XNVME_NVM_NO_SLOT) {
+            return -ENOTSUP;
+        }
         return submit(false, slba, nlb, buf, cookie);
     }
 
     int
-    submitWrite(uint64_t slba, uint16_t nlb, const void *buf, void *cookie) override {
+    submitWrite(uint64_t slba, uint16_t nlb, const void *buf, uint32_t slot, void *cookie)
+        override {
+        if (slot != XNVME_NVM_NO_SLOT) {
+            return -ENOTSUP;
+        }
         return submit(true, slba, nlb, const_cast<void *>(buf), cookie);
     }
 

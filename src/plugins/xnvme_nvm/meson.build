@@ -25,10 +25,10 @@ xnvme_nvm_backend_sources = files(
 
 xnvme_nvm_sources = [
     xnvme_nvm_backend_sources,
-    files('xnvme_nvm_dev.cpp', 'xnvme_nvm_plugin.cpp'),
+    files('xnvme_nvm_dev.cpp', 'xnvme_nvm_uring_dev.cpp', 'xnvme_nvm_plugin.cpp'),
 ]
 
-plugin_deps = [nixl_infra, nixl_common_dep, xnvme_dep]
+plugin_deps = [nixl_infra, nixl_common_dep, xnvme_dep, io_uring_dep]
 
 if 'XNVME_NVM' in static_plugins
     xnvme_nvm_backend_lib = static_library('XNVME_NVM',

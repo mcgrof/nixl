@@ -28,6 +28,44 @@ namespace {
 // A BLK_SEG registration: the byte range of the namespace a devId slot may
 // address. len 0 means the whole namespace (NIXL itself stores such a
 // registration with an unlimited range).
+// A registered host-side buffer (fixed or dma-buf mode): the slot the
+// device handed out and the virtual range the caller addresses it by.
+class nixlXnvmeNvmHostMetadata : public nixlBackendMD {
+public:
+    nixlXnvmeNvmHostMetadata(uint32_t slot, uintptr_t base, size_t len, bool is_dmabuf)
+        : nixlBackendMD(true),
+          slot(slot),
+          base(base),
+          len(len),
+          isDmabuf(is_dmabuf) {}
+
+    uint32_t slot;
+    uintptr_t base;
+    size_t len;
+    bool isDmabuf;
+};
+
+// Parses "dmabuf:<fd>" from a DRAM_SEG registration's metaInfo.
+bool
+parseDmabufMeta(const std::string &meta, int &fd) {
+    static const std::string prefix = "dmabuf:";
+    if (meta.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    try {
+        size_t pos = 0;
+        const long parsed = std::stol(meta.substr(prefix.size()), &pos, 10);
+        if (pos != meta.size() - prefix.size() || parsed < 0 || parsed > INT32_MAX) {
+            return false;
+        }
+        fd = static_cast<int>(parsed);
+        return true;
+    }
+    catch (const std::exception &) {
+        return false;
+    }
+}
+
 class nixlXnvmeNvmBlkMetadata : public nixlBackendMD {
 public:
     nixlXnvmeNvmBlkMetadata(uint64_t dev_id, uint64_t offset, size_t len)
@@ -75,6 +113,7 @@ parseBool(const std::string &text, bool &out) {
 uint32_t
 nixlXnvmeNvmEngine::computeMaxIoBytes(const nixlXnvmeNvmGeo &geo,
                                       bool passthrough,
+                                      nixlXnvmeNvmBufferMode mode,
                                       uint32_t user_max_io_bytes) {
     uint64_t limit = UINT64_MAX;
     auto fold = [&limit](uint64_t candidate) {
@@ -84,7 +123,14 @@ nixlXnvmeNvmEngine::computeMaxIoBytes(const nixlXnvmeNvmGeo &geo,
     };
     fold(geo.idfyMdtsBytes);
     fold(static_cast<uint64_t>(65536) * geo.lbaBytes);
-    fold(geo.sysfsMaxHwBytes);
+    // A dma-buf backed bio has its own hardware ceiling on kernels that
+    // carry the rw-dmabuf series; without the knob it is bounded like any
+    // other bio.
+    if (mode == nixlXnvmeNvmBufferMode::dmabuf && geo.sysfsMaxHwDmabufBytes) {
+        fold(geo.sysfsMaxHwDmabufBytes);
+    } else {
+        fold(geo.sysfsMaxHwBytes);
+    }
     // A passthrough command maps the user buffer as it is: the kernel
     // refuses one that needs more segments than the queue allows instead
     // of splitting it, and an ordinary host buffer can need one segment
@@ -115,7 +161,8 @@ nixlXnvmeNvmEngine::nixlXnvmeNvmEngine(const nixlBackendInitParams *init_params,
     }
 
     if (!dev_) {
-        dev_ = nixlXnvmeNvmDevCreate();
+        dev_ = bufferMode_ == nixlXnvmeNvmBufferMode::host ? nixlXnvmeNvmDevCreate() :
+                                                             nixlXnvmeNvmUringDevCreate();
     }
 
     status = initDevice();
@@ -139,9 +186,14 @@ nixlXnvmeNvmEngine::nixlXnvmeNvmEngine(const nixlBackendInitParams *init_params,
               << "' lba_bytes=" << g.lbaBytes << " capacity_bytes=" << g.capacityBytes
               << " idfy_mdts_bytes=" << g.idfyMdtsBytes << " xnvme_mdts_bytes=" << g.xnvmeMdtsBytes
               << " sysfs_max_hw_bytes=" << g.sysfsMaxHwBytes
-              << " sysfs_max_segments=" << g.sysfsMaxSegments << " page_bytes=" << g.pageBytes
-              << " max_io_bytes=" << maxIoBytes_ << " num_tasks=" << numTasks_
-              << " buffer_mode=host";
+              << " sysfs_max_segments=" << g.sysfsMaxSegments
+              << " sysfs_max_hw_dmabuf_bytes=" << g.sysfsMaxHwDmabufBytes
+              << " page_bytes=" << g.pageBytes << " max_io_bytes=" << maxIoBytes_
+              << " num_tasks=" << numTasks_ << " buffer_mode="
+              << (bufferMode_ == nixlXnvmeNvmBufferMode::host      ? "host" :
+                      bufferMode_ == nixlXnvmeNvmBufferMode::fixed ? "fixed" :
+                                                                     "dmabuf")
+              << (bufferMode_ == nixlXnvmeNvmBufferMode::host ? "" : " transport=liburing");
 }
 
 nixlXnvmeNvmEngine::~nixlXnvmeNvmEngine() {
@@ -225,6 +277,14 @@ nixlXnvmeNvmEngine::parseInitParams(const nixl_b_params_t *custom_params) {
         forceMaxIoBytes_ = static_cast<uint32_t>(value);
     }
 
+    if (auto it = custom_params->find("max_dmabuf_bytes"); it != custom_params->end()) {
+        if (!parseUnsigned(it->second, UINT64_MAX, value) || value == 0) {
+            NIXL_ERROR << "XNVME_NVM: invalid max_dmabuf_bytes '" << it->second << "'";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        maxDmabufBytes_ = value;
+    }
+
     if (auto it = custom_params->find("expect_serial"); it != custom_params->end()) {
         expectSerial_ = it->second;
     }
@@ -232,13 +292,26 @@ nixlXnvmeNvmEngine::parseInitParams(const nixl_b_params_t *custom_params) {
         expectWwid_ = it->second;
     }
 
-    if (auto it = custom_params->find("buffer_mode");
-        it != custom_params->end() && !it->second.empty() && it->second != "host") {
-        // fixed: the pinned xNVMe never consumes opts.register_buffers.
-        // dmabuf: needs the kernel lane's registration path (Phase 3).
-        NIXL_ERROR << "XNVME_NVM: buffer_mode '" << it->second
-                   << "' is not supported; only 'host' is";
-        return NIXL_ERR_NOT_SUPPORTED;
+    if (auto it = custom_params->find("buffer_mode"); it != custom_params->end()) {
+        if (it->second == "host" || it->second.empty()) {
+            bufferMode_ = nixlXnvmeNvmBufferMode::host;
+        } else if (it->second == "fixed") {
+            bufferMode_ = nixlXnvmeNvmBufferMode::fixed;
+        } else if (it->second == "dmabuf") {
+            bufferMode_ = nixlXnvmeNvmBufferMode::dmabuf;
+        } else {
+            NIXL_ERROR << "XNVME_NVM: buffer_mode must be host, fixed or dmabuf; got '"
+                       << it->second << "'";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+    }
+    if (bufferMode_ != nixlXnvmeNvmBufferMode::host && async_ != "io_uring") {
+        // Registered buffers ride READ_FIXED/WRITE_FIXED on the block node;
+        // passthrough cannot import them and the emulated interfaces have
+        // no ring.
+        NIXL_ERROR << "XNVME_NVM: buffer_mode fixed/dmabuf requires async=io_uring, got '" << async_
+                   << "'";
+        return NIXL_ERR_INVALID_PARAM;
     }
 
     return NIXL_SUCCESS;
@@ -287,7 +360,12 @@ nixlXnvmeNvmEngine::initDevice() {
         NIXL_WARN << "XNVME_NVM: no expect_serial/expect_wwid given; device identity unvalidated";
     }
 
-    maxIoBytes_ = computeMaxIoBytes(g, async_ == "io_uring_cmd", userMaxIoBytes_);
+    if (bufferMode_ != nixlXnvmeNvmBufferMode::host && !dev_->supportsRegistration()) {
+        NIXL_ERROR << "XNVME_NVM: the device layer does not support registered buffers";
+        dev_->close();
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+    maxIoBytes_ = computeMaxIoBytes(g, async_ == "io_uring_cmd", bufferMode_, userMaxIoBytes_);
     if (forceMaxIoBytes_) {
         // The NLB field is an encoding limit; everything else in the
         // ceiling is a limit the kernel or device enforces at its end, and
@@ -326,9 +404,44 @@ nixlXnvmeNvmEngine::registerMem(const nixlBlobDesc &mem,
                                 nixlBackendMD *&out) {
     out = nullptr;
 
-    if (nixl_mem == DRAM_SEG) {
-        // Host buffers go to the kernel as-is at submit time; nothing to
-        // pin or register here.
+    const bool vram_dmabuf = nixl_mem == VRAM_SEG && bufferMode_ == nixlXnvmeNvmBufferMode::dmabuf;
+    if (nixl_mem == DRAM_SEG || vram_dmabuf) {
+        if (bufferMode_ == nixlXnvmeNvmBufferMode::host) {
+            // Host buffers go to the kernel as-is at submit time; nothing to
+            // pin or register here.
+            return NIXL_SUCCESS;
+        }
+        if (mem.len == 0) {
+            NIXL_ERROR << "XNVME_NVM: a registered buffer needs a non-zero length";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        uint32_t slot = XNVME_NVM_NO_SLOT;
+        int err;
+        bool is_dmabuf = false;
+        if (bufferMode_ == nixlXnvmeNvmBufferMode::dmabuf) {
+            int fd = -1;
+            if (!parseDmabufMeta(mem.metaInfo, fd)) {
+                NIXL_ERROR << "XNVME_NVM: buffer_mode=dmabuf needs metaInfo 'dmabuf:<fd>' on "
+                              "every DRAM_SEG registration";
+                return NIXL_ERR_INVALID_PARAM;
+            }
+            if (mem.len > maxDmabufBytes_) {
+                NIXL_ERROR << "XNVME_NVM: dma-buf of " << mem.len
+                           << " bytes exceeds max_dmabuf_bytes " << maxDmabufBytes_
+                           << "; register it as several dma-bufs";
+                return NIXL_ERR_INVALID_PARAM;
+            }
+            err = dev_->registerDmabuf(fd, mem.len, slot);
+            is_dmabuf = true;
+        } else {
+            err = dev_->registerHostBuffer(reinterpret_cast<void *>(mem.addr), mem.len, slot);
+        }
+        if (err) {
+            NIXL_ERROR << "XNVME_NVM: buffer registration (" << (is_dmabuf ? "dmabuf" : "fixed")
+                       << ", " << mem.len << " bytes) failed: " << strerror(-err);
+            return NIXL_ERR_BACKEND;
+        }
+        out = new nixlXnvmeNvmHostMetadata(slot, mem.addr, mem.len, is_dmabuf);
         return NIXL_SUCCESS;
     }
     if (nixl_mem != BLK_SEG) {
@@ -366,7 +479,22 @@ nixlXnvmeNvmEngine::registerMem(const nixlBlobDesc &mem,
 
 nixl_status_t
 nixlXnvmeNvmEngine::deregisterMem(nixlBackendMD *meta) {
-    // Registration metadata only; the bytes stay on the device.
+    if (!meta) {
+        return NIXL_SUCCESS;
+    }
+    if (auto *host = dynamic_cast<nixlXnvmeNvmHostMetadata *>(meta)) {
+        // The kernel keeps a registered buffer pinned or mapped until the
+        // slot is cleared; in-flight commands on it were drained by their
+        // requests' release.
+        int err = dev_->unregisterBuffer(host->slot);
+        if (err) {
+            NIXL_WARN << "XNVME_NVM: unregistering slot " << host->slot
+                      << " failed: " << strerror(-err);
+        }
+        delete host;
+        return NIXL_SUCCESS;
+    }
+    // Block registration metadata only; the bytes stay on the device.
     delete static_cast<nixlXnvmeNvmBlkMetadata *>(meta);
     return NIXL_SUCCESS;
 }
@@ -416,8 +544,12 @@ nixlXnvmeNvmEngine::prepXfer(const nixl_xfer_op_t &operation,
         NIXL_WARN << "XNVME_NVM: remote agent (" << remote_agent << ") != local agent ("
                   << localAgent << "); XNVME_NVM is a local storage backend";
     }
-    if (local.getType() != DRAM_SEG) {
-        NIXL_ERROR << "XNVME_NVM: local descriptor list must be DRAM_SEG, got " << local.getType();
+    const bool local_ok = local.getType() == DRAM_SEG ||
+        (local.getType() == VRAM_SEG && bufferMode_ == nixlXnvmeNvmBufferMode::dmabuf);
+    if (!local_ok) {
+        NIXL_ERROR << "XNVME_NVM: local descriptor list must be DRAM_SEG (or VRAM_SEG in "
+                      "buffer_mode=dmabuf), got "
+                   << local.getType();
         return NIXL_ERR_INVALID_PARAM;
     }
     if (remote.getType() != BLK_SEG) {
@@ -470,6 +602,20 @@ nixlXnvmeNvmEngine::prepXfer(const nixl_xfer_op_t &operation,
             NIXL_ERROR << "XNVME_NVM: remote descriptor " << i << " has no registration metadata";
             return NIXL_ERR_INVALID_PARAM;
         }
+        if (bufferMode_ != nixlXnvmeNvmBufferMode::host) {
+            const auto *hmd = static_cast<const nixlXnvmeNvmHostMetadata *>(l.metadataP);
+            if (!hmd) {
+                NIXL_ERROR << "XNVME_NVM: local descriptor " << i
+                           << " is not a registered buffer (buffer_mode requires it)";
+                return NIXL_ERR_INVALID_PARAM;
+            }
+            if (l.addr < hmd->base || l.len > hmd->len || l.addr - hmd->base > hmd->len - l.len) {
+                NIXL_ERROR << "XNVME_NVM: local descriptor " << i << " [0x" << std::hex << l.addr
+                           << ", +0x" << l.len << ") lies outside its registration [0x" << hmd->base
+                           << ", +0x" << hmd->len << ")" << std::dec;
+                return NIXL_ERR_INVALID_PARAM;
+            }
+        }
         if (md->len != 0 &&
             (r.len > md->len || r.addr < md->offset || r.addr - md->offset > md->len - r.len)) {
             NIXL_ERROR << "XNVME_NVM: descriptor " << i << " offset=" << r.addr << " len=" << r.len
@@ -499,6 +645,13 @@ nixlXnvmeNvmEngine::prepXfer(const nixl_xfer_op_t &operation,
             task.slba = (r.addr + done) / lba;
             task.nlb = static_cast<uint16_t>(bytes / lba - 1);
             task.buf = reinterpret_cast<void *>(l.addr + done);
+            if (bufferMode_ != nixlXnvmeNvmBufferMode::host) {
+                const auto *hmd = static_cast<const nixlXnvmeNvmHostMetadata *>(l.metadataP);
+                task.slot = hmd->slot;
+                if (hmd->isDmabuf) {
+                    task.buf = reinterpret_cast<void *>(l.addr - hmd->base + done);
+                }
+            }
             req_h->tasks_.push_back(task);
         }
     }

@@ -20,6 +20,7 @@
 // the xNVMe device seam, so no NVMe device, xNVMe library, or io_uring
 // support is needed.
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,11 @@
 // backend's fallback reference with a stub.
 std::unique_ptr<nixlXnvmeNvmDevIface>
 nixlXnvmeNvmDevCreate() {
+    return nullptr;
+}
+
+std::unique_ptr<nixlXnvmeNvmDevIface>
+nixlXnvmeNvmUringDevCreate() {
     return nullptr;
 }
 
@@ -211,23 +217,31 @@ TEST(XnvmeNvmCeiling, SmallestNonZeroSourceWins) {
     g.lbaBytes = 512;
     g.idfyMdtsBytes = 2u << 20;
     g.sysfsMaxHwBytes = 128u << 10;
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, 0), 128u << 10);
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, 64u << 10), 64u << 10);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
+              128u << 10);
+    EXPECT_EQ(
+        nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 64u << 10),
+        64u << 10);
     g.sysfsMaxHwBytes = 0;
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, 0), 2u << 20);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
+              2u << 20);
 }
 
 TEST(XnvmeNvmCeiling, NlbFieldAlwaysCaps) {
     nixlXnvmeNvmGeo g;
     g.lbaBytes = 512;
     g.idfyMdtsBytes = UINT32_MAX; // unbounded MDTS
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, 0), 65536u * 512u);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
+              65536u * 512u);
     g.idfyMdtsBytes = 0; // not reported at all: the NLB field still bounds it
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, 0), 65536u * 512u);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
+              65536u * 512u);
     // Rounded down to a whole block, never below one block.
     g.lbaBytes = 4096;
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, 5000), 4096u);
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, 100), 4096u);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 5000),
+              4096u);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 100),
+              4096u);
 }
 
 TEST(XnvmeNvmCeiling, PassthroughIsBoundedBySegmentsTimesPages) {
@@ -239,10 +253,13 @@ TEST(XnvmeNvmCeiling, PassthroughIsBoundedBySegmentsTimesPages) {
     g.pageBytes = 4096;
     // The kernel cannot split a passthrough command, so a scattered host
     // buffer is limited to one page per segment; the block paths are not.
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, true, 0), 512u << 10);
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, 0), 2u << 20);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, true, nixlXnvmeNvmBufferMode::host, 0),
+              512u << 10);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
+              2u << 20);
     g.sysfsMaxSegments = 0; // unknown: nothing to fold
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, true, 0), 2u << 20);
+    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, true, nixlXnvmeNvmBufferMode::host, 0),
+              2u << 20);
 }
 
 TEST(XnvmeNvmParams, PassthroughCeilingUsesTheSegmentLimit) {
@@ -277,6 +294,211 @@ TEST(XnvmeNvmParams, ForcedCeilingOverridesButNotBeyondNlb) {
                  std::runtime_error);
     EXPECT_THROW(EngineMaker({{"device_name", "/dev/mock0"}, {"max_io_bytes_force", "100"}}).make(),
                  std::runtime_error);
+}
+
+// --- registered buffers --------------------------------------------------------
+
+TEST(XnvmeNvmRegistered, ModeNeedsIoUringAndRegistrationSupport) {
+    EXPECT_THROW(EngineMaker({{"device_name", "/dev/mock0"}, {"buffer_mode", "fixed"}}).make(),
+                 std::runtime_error); // default async is passthrough
+    EXPECT_THROW(EngineMaker({{"device_name", "/dev/mock0"}, {"buffer_mode", "pool"}}).make(),
+                 std::runtime_error);
+    EngineMaker unsupported(
+        {{"device_name", "/dev/mock0"}, {"async", "io_uring"}, {"buffer_mode", "fixed"}});
+    EXPECT_THROW(unsupported.make(), std::runtime_error); // mock: registration off
+}
+
+TEST(XnvmeNvmRegistered, FixedRegistersAndTransfersWithSlots) {
+    EngineMaker maker(
+        {{"device_name", "/dev/mock0"}, {"async", "io_uring"}, {"buffer_mode", "fixed"}});
+    maker.configureMock = [](nixlXnvmeNvmMockDev &m) { m.registration = true; };
+    auto engine = maker.make();
+    EXPECT_EQ(engine->bufferMode(), nixlXnvmeNvmBufferMode::fixed);
+
+    AlignedBuf buf(16384);
+    XferHarness::fill(buf, 3);
+    nixlBlobDesc dram(reinterpret_cast<uintptr_t>(buf.data), buf.size, 0, "");
+    nixlBackendMD *hmd = nullptr;
+    ASSERT_EQ(engine->registerMem(dram, DRAM_SEG, hmd), NIXL_SUCCESS);
+    ASSERT_NE(hmd, nullptr);
+    EXPECT_EQ(maker.mock->registerCalls, 1);
+    nixlBackendMD *bmd = nullptr;
+    ASSERT_EQ(engine->registerMem(nixlBlobDesc(0, 0, 0, ""), BLK_SEG, bmd), NIXL_SUCCESS);
+
+    // Transfer the second half of the registered buffer to offset 4096.
+    nixl_meta_dlist_t local(DRAM_SEG), remote(BLK_SEG);
+    nixlMetaDesc l(reinterpret_cast<uintptr_t>(buf.data) + 8192, 8192, 0);
+    l.metadataP = hmd;
+    local.addDesc(l);
+    nixlMetaDesc r(4096, 8192, 0);
+    r.metadataP = bmd;
+    remote.addDesc(r);
+    nixlBackendReqH *handle = nullptr;
+    ASSERT_EQ(engine->prepXfer(NIXL_WRITE, local, remote, kAgent, handle), NIXL_SUCCESS);
+    nixl_status_t st = engine->postXfer(NIXL_WRITE, local, remote, kAgent, handle);
+    for (int i = 0; st == NIXL_IN_PROG && i < 1000; i++) {
+        st = engine->checkXfer(handle);
+    }
+    EXPECT_EQ(st, NIXL_SUCCESS);
+    engine->releaseReqH(handle);
+    ASSERT_EQ(maker.mock->submittedSlots.size(), 1u);
+    EXPECT_EQ(maker.mock->submittedSlots[0], 0u);
+    EXPECT_EQ(memcmp(maker.mock->store.data() + 4096, buf.data + 8192, 8192), 0);
+
+    // A local descriptor that is not registered, or outside its registration, is refused.
+    nixl_meta_dlist_t bad(DRAM_SEG);
+    nixlMetaDesc unreg(reinterpret_cast<uintptr_t>(buf.data), 8192, 0);
+    unreg.metadataP = nullptr;
+    bad.addDesc(unreg);
+    EXPECT_EQ(engine->prepXfer(NIXL_WRITE, bad, remote, kAgent, handle), NIXL_ERR_INVALID_PARAM);
+    nixl_meta_dlist_t outside(DRAM_SEG);
+    nixlMetaDesc past(reinterpret_cast<uintptr_t>(buf.data) + 12288, 8192, 0);
+    past.metadataP = hmd;
+    outside.addDesc(past);
+    EXPECT_EQ(engine->prepXfer(NIXL_WRITE, outside, remote, kAgent, handle),
+              NIXL_ERR_INVALID_PARAM);
+
+    engine->deregisterMem(hmd);
+    EXPECT_EQ(maker.mock->unregisterCalls, 1);
+    engine->deregisterMem(bmd);
+}
+
+TEST(XnvmeNvmRegistered, DmabufUsesOffsetsAndItsOwnCeiling) {
+    EngineMaker maker(
+        {{"device_name", "/dev/mock0"}, {"async", "io_uring"}, {"buffer_mode", "dmabuf"}});
+    AlignedBuf backing(16384);
+    maker.configureMock = [&backing](nixlXnvmeNvmMockDev &m) {
+        m.registration = true;
+        m.dmabufBacking[42] = backing.data;
+        m.sysfsMaxHwBytes = 128u << 10; // the clamp
+        m.sysfsMaxHwDmabufBytes = 2u << 20; // lifted for dma-buf bios
+        m.idfyMdtsBytes = 2u << 20;
+    };
+    auto engine = maker.make();
+    EXPECT_EQ(engine->maxIoBytes(), 2u << 20);
+
+    // Registration names the dma-buf by fd; addr is whatever base the caller
+    // addresses the buffer by (here its mapping), never sent to the kernel.
+    nixlBackendMD *hmd = nullptr;
+    EXPECT_EQ(
+        engine->registerMem(
+            nixlBlobDesc(reinterpret_cast<uintptr_t>(backing.data), 16384, 0, ""), DRAM_SEG, hmd),
+        NIXL_ERR_INVALID_PARAM); // no dmabuf:<fd>
+    ASSERT_EQ(engine->registerMem(
+                  nixlBlobDesc(reinterpret_cast<uintptr_t>(backing.data), 16384, 0, "dmabuf:42"),
+                  DRAM_SEG,
+                  hmd),
+              NIXL_SUCCESS);
+    nixlBackendMD *bmd = nullptr;
+    ASSERT_EQ(engine->registerMem(nixlBlobDesc(0, 0, 0, ""), BLK_SEG, bmd), NIXL_SUCCESS);
+
+    XferHarness::fill(backing, 9);
+    nixl_meta_dlist_t local(DRAM_SEG), remote(BLK_SEG);
+    nixlMetaDesc l(reinterpret_cast<uintptr_t>(backing.data) + 4096, 8192, 0);
+    l.metadataP = hmd;
+    local.addDesc(l);
+    nixlMetaDesc r(65536, 8192, 0);
+    r.metadataP = bmd;
+    remote.addDesc(r);
+    nixlBackendReqH *handle = nullptr;
+    ASSERT_EQ(engine->prepXfer(NIXL_WRITE, local, remote, kAgent, handle), NIXL_SUCCESS);
+    // The mock fails a dma-buf command that carries an address instead of
+    // the byte offset, so a byte-exact store proves the offset semantics.
+    nixl_status_t st = engine->postXfer(NIXL_WRITE, local, remote, kAgent, handle);
+    for (int i = 0; st == NIXL_IN_PROG && i < 1000; i++) {
+        st = engine->checkXfer(handle);
+    }
+    EXPECT_EQ(st, NIXL_SUCCESS);
+    engine->releaseReqH(handle);
+    EXPECT_EQ(memcmp(maker.mock->store.data() + 65536, backing.data + 4096, 8192), 0);
+    engine->deregisterMem(hmd);
+    engine->deregisterMem(bmd);
+}
+
+TEST(XnvmeNvmRegistered, DmabufLargerThanTheKernelLimitIsRefused) {
+    // The kernel refuses a dma-buf above 1 GiB with a bare EINVAL; the
+    // backend refuses it first with the reason, and the limit is a parameter.
+    AlignedBuf backing(16384);
+    auto make = [&backing](const std::string &limit) {
+        nixl_b_params_t p{
+            {"device_name", "/dev/mock0"}, {"async", "io_uring"}, {"buffer_mode", "dmabuf"}};
+        if (!limit.empty()) {
+            p["max_dmabuf_bytes"] = limit;
+        }
+        EngineMaker maker(p);
+        maker.configureMock = [&backing](nixlXnvmeNvmMockDev &m) {
+            m.registration = true;
+            m.dmabufBacking[42] = backing.data;
+        };
+        return maker.make();
+    };
+    const uintptr_t base = reinterpret_cast<uintptr_t>(backing.data);
+    nixlBackendMD *md = nullptr;
+    auto engine = make("");
+    EXPECT_EQ(engine->registerMem(
+                  nixlBlobDesc(base, (size_t(1) << 30) + 4096, 0, "dmabuf:42"), DRAM_SEG, md),
+              NIXL_ERR_INVALID_PARAM);
+    EXPECT_EQ(md, nullptr);
+    ASSERT_EQ(
+        engine->registerMem(nixlBlobDesc(base, size_t(1) << 30, 0, "dmabuf:42"), DRAM_SEG, md),
+        NIXL_SUCCESS);
+    engine->deregisterMem(md);
+
+    auto small = make("8192");
+    md = nullptr;
+    EXPECT_EQ(small->registerMem(nixlBlobDesc(base, 16384, 0, "dmabuf:42"), DRAM_SEG, md),
+              NIXL_ERR_INVALID_PARAM);
+    ASSERT_EQ(small->registerMem(nixlBlobDesc(base, 8192, 0, "dmabuf:42"), DRAM_SEG, md),
+              NIXL_SUCCESS);
+    small->deregisterMem(md);
+    EXPECT_THROW(make("0"), std::exception);
+}
+
+TEST(XnvmeNvmRegistered, VramIsOnlyReachableAsADmabuf) {
+    EngineMaker host;
+    auto plain = host.make();
+    nixlBackendMD *md = nullptr;
+    EXPECT_EQ(plain->registerMem(nixlBlobDesc(0x1000, 4096, 0, "dmabuf:7"), VRAM_SEG, md),
+              NIXL_ERR_NOT_SUPPORTED);
+    const auto mems = plain->getSupportedMems();
+    EXPECT_EQ(std::count(mems.begin(), mems.end(), VRAM_SEG), 0);
+
+    EngineMaker maker(
+        {{"device_name", "/dev/mock0"}, {"async", "io_uring"}, {"buffer_mode", "dmabuf"}});
+    AlignedBuf backing(8192);
+    maker.configureMock = [&backing](nixlXnvmeNvmMockDev &m) {
+        m.registration = true;
+        m.dmabufBacking[7] = backing.data;
+    };
+    auto engine = maker.make();
+    const auto dmems = engine->getSupportedMems();
+    EXPECT_EQ(std::count(dmems.begin(), dmems.end(), VRAM_SEG), 1);
+    // The "device pointer" is any base the caller chooses; only the fd
+    // reaches the kernel and the command carries an offset.
+    const uintptr_t gpu_base = 0x7f0000000000ull;
+    ASSERT_EQ(engine->registerMem(nixlBlobDesc(gpu_base, 8192, 0, "dmabuf:7"), VRAM_SEG, md),
+              NIXL_SUCCESS);
+    nixlBackendMD *bmd = nullptr;
+    ASSERT_EQ(engine->registerMem(nixlBlobDesc(0, 0, 0, ""), BLK_SEG, bmd), NIXL_SUCCESS);
+    XferHarness::fill(backing, 5);
+    nixl_meta_dlist_t local(VRAM_SEG), remote(BLK_SEG);
+    nixlMetaDesc l(gpu_base + 4096, 4096, 0);
+    l.metadataP = md;
+    local.addDesc(l);
+    nixlMetaDesc r(8192, 4096, 0);
+    r.metadataP = bmd;
+    remote.addDesc(r);
+    nixlBackendReqH *handle = nullptr;
+    ASSERT_EQ(engine->prepXfer(NIXL_WRITE, local, remote, kAgent, handle), NIXL_SUCCESS);
+    nixl_status_t st = engine->postXfer(NIXL_WRITE, local, remote, kAgent, handle);
+    for (int i = 0; st == NIXL_IN_PROG && i < 1000; i++) {
+        st = engine->checkXfer(handle);
+    }
+    EXPECT_EQ(st, NIXL_SUCCESS);
+    engine->releaseReqH(handle);
+    EXPECT_EQ(memcmp(maker.mock->store.data() + 8192, backing.data + 4096, 4096), 0);
+    engine->deregisterMem(md);
+    engine->deregisterMem(bmd);
 }
 
 TEST(XnvmeNvmCpl, KernelErrnoDecodes) {

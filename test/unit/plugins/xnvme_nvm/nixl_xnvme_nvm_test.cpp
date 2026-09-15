@@ -29,6 +29,17 @@
 
 #include <fcntl.h>
 #include <getopt.h>
+#include <linux/dma-heap.h>
+#include <linux/udmabuf.h>
+
+// A hugetlb memfd needs these; older glibc headers do not carry them.
+#ifndef MFD_HUGETLB
+#define MFD_HUGETLB 0x0004U
+#endif
+#ifndef MFD_HUGE_2MB
+#define MFD_HUGE_2MB (21U << 26)
+#endif
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -62,6 +73,11 @@ struct Options {
     uint64_t maxIoBytes = 0;
     uint64_t maxIoBytesForce = 0;
     bool hugepage = false; // 2 MiB-aligned buffers advised MADV_HUGEPAGE
+    std::string bufferMode = "host"; // host | fixed | dmabuf
+    // dmabuf mode only: sysheap (/dev/dma_heap/system), heap:<name> for any
+    // other dma-buf heap (a CMA heap, say), udmabuf, or udmabuf-huge (a
+    // hugetlb memfd, so the exporter hands out 2 MiB folios).
+    std::string dmabufSource = "sysheap";
     bool expectRefusal = false; // pass when the kernel or device refuses every command
     uint64_t generation = 0;
     uint64_t seed = 0x5eed;
@@ -166,6 +182,8 @@ public:
             }
         }
         bufs_.resize(o_.objects);
+        dmabufFds_.assign(o_.objects, -1);
+        mapLen_.assign(o_.objects, 0);
         const size_t huge = 2u << 20;
         for (uint32_t i = 0; i < o_.objects; i++) {
             size_t align = o_.alignment, size = o_.objectSize;
@@ -173,13 +191,32 @@ public:
                 align = huge;
                 size = (size + huge - 1) / huge * huge;
             }
-            bufs_[i] = static_cast<uint8_t *>(aligned_alloc(align, size));
-            if (!bufs_[i]) {
-                fprintf(stderr, "aligned_alloc failed\n");
-                exit(1);
-            }
-            if (o_.hugepage && madvise(bufs_[i], size, MADV_HUGEPAGE) != 0) {
-                perror("madvise(MADV_HUGEPAGE)");
+            if (o_.bufferMode == "dmabuf") {
+                // The payload lives in a dma-buf; the harness maps it only
+                // to fill and verify patterns, the I/O path never sees the
+                // mapping. A GPU dma-buf plugs into the same registration.
+                const size_t map = (size + 4095) / 4096 * 4096;
+                dmabufFds_[i] = allocDmabuf(o_.dmabufSource, map);
+                if (dmabufFds_[i] < 0) {
+                    fprintf(stderr, "dma-buf allocation (%s) failed\n", o_.dmabufSource.c_str());
+                    exit(1);
+                }
+                void *p = mmap(nullptr, map, PROT_READ | PROT_WRITE, MAP_SHARED, dmabufFds_[i], 0);
+                if (p == MAP_FAILED) {
+                    perror("mmap(dma-buf)");
+                    exit(1);
+                }
+                bufs_[i] = static_cast<uint8_t *>(p);
+                mapLen_[i] = map;
+            } else {
+                bufs_[i] = static_cast<uint8_t *>(aligned_alloc(align, size));
+                if (!bufs_[i]) {
+                    fprintf(stderr, "aligned_alloc failed\n");
+                    exit(1);
+                }
+                if (o_.hugepage && madvise(bufs_[i], size, MADV_HUGEPAGE) != 0) {
+                    perror("madvise(MADV_HUGEPAGE)");
+                }
             }
             // Touch every page so the backing is decided before the first
             // I/O and a huge-page buffer is one physical extent.
@@ -187,7 +224,10 @@ public:
         }
         nixl_reg_dlist_t dram(DRAM_SEG);
         for (uint32_t i = 0; i < o_.objects; i++) {
-            dram.addDesc(nixlBlobDesc(reinterpret_cast<uintptr_t>(bufs_[i]), o_.objectSize, 0, ""));
+            const std::string meta =
+                o_.bufferMode == "dmabuf" ? "dmabuf:" + std::to_string(dmabufFds_[i]) : "";
+            const size_t reg_len = o_.bufferMode == "dmabuf" ? mapLen_[i] : o_.objectSize;
+            dram.addDesc(nixlBlobDesc(reinterpret_cast<uintptr_t>(bufs_[i]), reg_len, 0, meta));
         }
         nixl_reg_dlist_t blk(remoteType_);
         blk.addDesc(nixlBlobDesc(o_.rangeOffset, posix_ ? 0 : o_.rangeLen, devId(), ""));
@@ -201,12 +241,93 @@ public:
     ~Harness() {
         agent_.deregisterMem(dram_, &extra_);
         agent_.deregisterMem(blk_, &extra_);
-        for (auto *b : bufs_) {
-            free(b);
+        for (uint32_t i = 0; i < bufs_.size(); i++) {
+            if (dmabufFds_[i] >= 0) {
+                munmap(bufs_[i], mapLen_[i]);
+                close(dmabufFds_[i]);
+            } else {
+                free(bufs_[i]);
+            }
         }
         if (fd_ >= 0) {
             close(fd_);
         }
+    }
+
+    static constexpr size_t kHuge2M = 2u << 20;
+
+    static int
+    allocDmabuf(const std::string &source, size_t len) {
+        if (source == "udmabuf") {
+            return udmabufAlloc(len, false);
+        }
+        if (source == "udmabuf-huge") {
+            return udmabufAlloc(len, true);
+        }
+        if (source == "sysheap") {
+            return heapAlloc("system", len);
+        }
+        if (source.rfind("heap:", 0) == 0) {
+            return heapAlloc(source.substr(5), len);
+        }
+        fprintf(stderr, "unknown --dmabuf-source '%s'\n", source.c_str());
+        return -1;
+    }
+
+    static int
+    heapAlloc(const std::string &name, size_t len) {
+        const std::string path = "/dev/dma_heap/" + name;
+        int heap = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (heap < 0) {
+            perror(path.c_str());
+            return -1;
+        }
+        struct dma_heap_allocation_data a;
+        memset(&a, 0, sizeof(a));
+        a.len = len;
+        a.fd_flags = O_RDWR | O_CLOEXEC;
+        int rc = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &a);
+        close(heap);
+        if (rc < 0) {
+            perror("DMA_HEAP_IOCTL_ALLOC");
+            return -1;
+        }
+        return static_cast<int>(a.fd);
+    }
+
+    static int
+    udmabufAlloc(size_t len, bool hugetlb) {
+        // A hugetlb memfd must be a multiple of the huge page; the dma-buf is
+        // created over the requested length either way.
+        unsigned flags = MFD_ALLOW_SEALING;
+        size_t memlen = len;
+        if (hugetlb) {
+            flags |= MFD_HUGETLB | MFD_HUGE_2MB;
+            memlen = (len + kHuge2M - 1) / kHuge2M * kHuge2M;
+        }
+        int mem = memfd_create("nixl-xnvme-nvm", flags);
+        if (mem < 0 || ftruncate(mem, memlen) != 0 || fcntl(mem, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
+            perror(hugetlb ? "memfd(hugetlb; is nr_hugepages large enough?)" : "memfd");
+            return -1;
+        }
+        struct udmabuf_create c;
+        memset(&c, 0, sizeof(c));
+        c.memfd = mem;
+        c.flags = UDMABUF_FLAGS_CLOEXEC;
+        c.offset = 0;
+        c.size = len;
+        int dev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (dev < 0) {
+            perror("open(/dev/udmabuf)");
+            return -1;
+        }
+        int fd = ioctl(dev, UDMABUF_CREATE, &c);
+        close(dev);
+        close(mem);
+        if (fd < 0) {
+            perror("UDMABUF_CREATE");
+        }
+        return fd;
     }
 
     uint64_t
@@ -355,6 +476,8 @@ private:
     nixl_reg_dlist_t dram_{DRAM_SEG};
     nixl_reg_dlist_t blk_{BLK_SEG};
     std::vector<uint8_t *> bufs_;
+    std::vector<int> dmabufFds_;
+    std::vector<size_t> mapLen_;
     Device dev_;
     uint32_t requestId_ = 0;
 };
@@ -389,6 +512,7 @@ run(const Options &o) {
         if (o.maxIoBytesForce) {
             params["max_io_bytes_force"] = std::to_string(o.maxIoBytesForce);
         }
+        params["buffer_mode"] = o.bufferMode;
         if (!o.expectSerial.empty()) {
             params["expect_serial"] = o.expectSerial;
         }
@@ -414,12 +538,14 @@ run(const Options &o) {
            (unsigned long long)d.maxIo);
     if (trace) {
         fprintf(trace,
-                "{\"event\":\"device\",\"backend\":\"%s\",\"join_key\":\"%s\","
+                "{\"event\":\"device\",\"backend\":\"%s\",\"buffer_mode\":\"%s\","
+                "\"join_key\":\"%s\","
                 "\"device\":\"%s\",\"async\":\"%s\",\"serial\":\"%s\","
                 "\"wwid\":\"%s\",\"capacity_bytes\":%llu,\"lba_bytes\":%llu,"
                 "\"max_io_bytes\":%llu,\"range_offset\":%llu,\"range_len\":%llu,"
                 "\"objects\":%u,\"object_size\":%llu,\"num_tasks\":%u,\"seed\":%llu}\n",
                 o.backend.c_str(),
+                o.bufferMode.c_str(),
                 o.backend == "POSIX" ? "file_offset" : "device_lba",
                 o.device.c_str(),
                 o.async.c_str(),
@@ -524,7 +650,9 @@ usage(const char *prog) {
             "  [--async io_uring_cmd|io_uring|libaio|posix|thrpool]\n"
             "  [--range-offset BYTES] [--range-len BYTES] [--objects N] [--object-size BYTES]\n"
             "  [--batch N] [--num-tasks N] [--max-io-bytes BYTES] [--max-io-bytes-force BYTES]\n"
-            "  [--hugepage] [--expect-refusal] [--generation N] [--seed N]\n"
+            "  [--hugepage] [--buffer-mode host|fixed|dmabuf]\n"
+            "  [--dmabuf-source sysheap|heap:<name>|udmabuf|udmabuf-huge]\n"
+            "  [--expect-refusal] [--generation N] [--seed N]\n"
             "  [--expect-serial S] [--expect-wwid W] [--trace-out FILE]\n",
             prog);
 }
@@ -551,6 +679,8 @@ main(int argc, char **argv) {
         {"max-io-bytes", required_argument, nullptr, 'm'},
         {"max-io-bytes-force", required_argument, nullptr, 'F'},
         {"hugepage", no_argument, nullptr, 'H'},
+        {"buffer-mode", required_argument, nullptr, 'M'},
+        {"dmabuf-source", required_argument, nullptr, 'D'},
         {"expect-refusal", no_argument, nullptr, 'R'},
         {"generation", required_argument, nullptr, 'g'},
         {"seed", required_argument, nullptr, 'S'},
@@ -562,7 +692,7 @@ main(int argc, char **argv) {
     };
     int c;
     while ((c = getopt_long(
-                argc, argv, "B:d:a:o:l:n:s:b:q:m:F:HRg:S:E:W:t:h", longopts, nullptr)) != -1) {
+                argc, argv, "B:d:a:o:l:n:s:b:q:m:F:HM:D:Rg:S:E:W:t:h", longopts, nullptr)) != -1) {
         switch (c) {
         case 'B':
             o.backend = optarg;
@@ -600,6 +730,12 @@ main(int argc, char **argv) {
         case 'H':
             o.hugepage = true;
             break;
+        case 'M':
+            o.bufferMode = optarg;
+            break;
+        case 'D':
+            o.dmabufSource = optarg;
+            break;
         case 'R':
             o.expectRefusal = true;
             break;
@@ -626,6 +762,10 @@ main(int argc, char **argv) {
     if (o.device.empty()) {
         printf("no --device and NIXL_XNVME_NVM_DEVICE unset; skipping XNVME_NVM device test\n");
         return 77; // meson skip
+    }
+    if (o.bufferMode != "host" && o.bufferMode != "fixed" && o.bufferMode != "dmabuf") {
+        fprintf(stderr, "buffer-mode must be host, fixed or dmabuf\n");
+        return 2;
     }
     if (o.backend != "XNVME_NVM" && o.backend != "POSIX") {
         fprintf(stderr, "backend must be XNVME_NVM or POSIX\n");

@@ -56,8 +56,14 @@ struct nixlXnvmeNvmTask {
     uint32_t bytes = 0;
     uint64_t slba = 0;
     uint16_t nlb = 0;
+    // A plain host pointer, or with a registered slot either the address
+    // inside a registered host buffer or the byte offset inside a dma-buf.
     void *buf = nullptr;
+    uint32_t slot = XNVME_NVM_NO_SLOT;
 };
+
+// How host-side payload buffers reach the kernel.
+enum class nixlXnvmeNvmBufferMode { host, fixed, dmabuf };
 
 class nixlXnvmeNvmBackendReqH : public nixlBackendReqH {
 public:
@@ -130,6 +136,11 @@ public:
 
     nixl_mem_list_t
     getSupportedMems() const override {
+        // A GPU buffer is reachable only as a dma-buf: VRAM_SEG registers
+        // through the same dma-buf path with the device pointer as its base.
+        if (bufferMode_ == nixlXnvmeNvmBufferMode::dmabuf) {
+            return {BLK_SEG, DRAM_SEG, VRAM_SEG};
+        }
         return {BLK_SEG, DRAM_SEG};
     }
 
@@ -199,11 +210,19 @@ public:
 
     // The ceiling rule, exposed for tests: the smallest non-zero of the
     // Identify MDTS, the 16-bit NLB field (always present), the kernel's
-    // max_hw_sectors_kb, for passthrough the kernel's max_segments worth
-    // of host pages, and the user's max_io_bytes, rounded down to a
-    // logical block.
+    // max_hw_sectors_kb (max_hw_dmabuf_sectors_kb for dma-buf payloads),
+    // for passthrough the kernel's max_segments worth of host pages, and
+    // the user's max_io_bytes, rounded down to a logical block.
     static uint32_t
-    computeMaxIoBytes(const nixlXnvmeNvmGeo &geo, bool passthrough, uint32_t user_max_io_bytes);
+    computeMaxIoBytes(const nixlXnvmeNvmGeo &geo,
+                      bool passthrough,
+                      nixlXnvmeNvmBufferMode mode,
+                      uint32_t user_max_io_bytes);
+
+    nixlXnvmeNvmBufferMode
+    bufferMode() const {
+        return bufferMode_;
+    }
 
 private:
     nixl_status_t
@@ -232,6 +251,10 @@ private:
     uint32_t maxIoBytes_ = 0;
     std::string expectSerial_;
     std::string expectWwid_;
+    nixlXnvmeNvmBufferMode bufferMode_ = nixlXnvmeNvmBufferMode::host;
+    // Largest dma-buf the kernel registers (rw-dmabuf v6 refuses more than
+    // 1 GiB with EINVAL); refused here with a message instead.
+    uint64_t maxDmabufBytes_ = uint64_t(1) << 30;
 
     // BLK_SEG devId -> path bound at registration, so one slot cannot be
     // re-registered against a different device.

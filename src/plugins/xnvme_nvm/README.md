@@ -71,10 +71,43 @@ never a partial success. Counters (`descs_requested`, `cmds_submitted`,
 The pairing is checked at init: passthrough needs a namespace character
 device, the block paths need a block device or file.
 
-Host buffers are handed to the kernel as-is: no copy, no pinning, no
-registration. `buffer_mode` accepts only `host`; `fixed` is refused because
-the pinned xNVMe never consumes its `register_buffers` option, and `dmabuf`
-is refused until a kernel path for it exists.
+## Buffer modes
+
+| `buffer_mode` | Payload | Transport | Kernel requirement |
+| --- | --- | --- | --- |
+| `host` (default) | plain host pointers, handed to the kernel as-is | xNVMe (`async` as above) | any |
+| `fixed` | host memory registered with io_uring at `registerMem` | liburing `READ_FIXED`/`WRITE_FIXED` on the block node or file (`async=io_uring` only) | `RLIMIT_MEMLOCK` or `CAP_IPC_LOCK` for the pinned bytes |
+| `dmabuf` | dma-bufs registered with io_uring at `registerMem`; `metaInfo` = `dmabuf:<fd>` | same | a kernel with the rw-dmabuf io_uring registration (`IO_REGBUF_TYPE_DMABUF`); otherwise registration fails with `EINVAL` |
+
+In `fixed` and `dmabuf` modes every `DRAM_SEG` descriptor of a transfer must
+lie inside a registered buffer. The registration's `addr` is the base the
+caller addresses the buffer by; for a dma-buf it may be its mapping or a
+device pointer and is never sent to the kernel, the command carries the
+byte offset into the dma-buf instead. This is the payload path a GPU
+dma-buf takes without further backend changes. The two registered modes
+bypass xNVMe (the pinned revision never consumes its `register_buffers`
+option) and drive liburing directly; the dma-buf registration structures
+are mirrored in the plugin because no released header carries them.
+
+On a kernel that carries the rw-dmabuf series the ceiling of `dmabuf`
+mode comes from `max_hw_dmabuf_sectors_kb` instead of `max_hw_sectors_kb`,
+so a dma-buf command can be MDTS-sized where an ordinary bio is clamped.
+Measured on an emulated NVMe behind a translating IOMMU (clamp 128 KiB,
+dma-buf ceiling 2 MiB): 2 MiB objects go out as 1536 commands of 128 KiB
+in `fixed` mode and as one 2 MiB command each in `dmabuf` mode.
+
+Limits of the rw-dmabuf registration at v6, which `dmabuf` mode inherits:
+one dma-buf is at most 1 GiB (a flat byte constant in the kernel, refused
+here before the syscall, see `max_dmabuf_bytes`); the target is the
+O_DIRECT block node or, with the iomap patches, an O_DIRECT file, never
+the `/dev/ng` passthrough node, so `async` must be `io_uring`; the ring
+cannot use IOPOLL. The exporter is the caller's choice and invisible
+here: the system heap, udmabuf over a memfd (hugetlb or not) and a GPU
+dma-buf all register the same way. Folio size matters only behind the
+mapping: on a translating IOMMU any dma-buf yields MDTS-sized commands,
+on `iommu=pt` a command is bounded by `max_segments` times the smallest
+chunk (4 KiB chunks cap it at 1 MiB), so report the achieved command
+sizes with any dma-buf number.
 
 ## Parameters
 
@@ -89,7 +122,8 @@ is refused until a kernel path for it exists.
 | `max_io_bytes_force` | `0` (off) | replaces the computed ceiling, bounded only by the NLB field; the kernel or device may refuse the commands. For physically contiguous (huge-page) buffers that can legitimately exceed the segment term, and for failure injection |
 | `expect_serial` | (unset) | controller serial that must match sysfs before any command |
 | `expect_wwid` | (unset) | namespace WWID that must match sysfs before any command |
-| `buffer_mode` | `host` | only `host` is supported |
+| `buffer_mode` | `host` | `host`, `fixed` or `dmabuf`; see Buffer modes |
+| `max_dmabuf_bytes` | `1073741824` | largest dma-buf accepted at `registerMem` in `dmabuf` mode; mirrors the kernel's flat 1 GiB limit (not a page-size term), override only for a kernel that changed it |
 
 At init the plugin logs the device type, identity, geometry, every ceiling
 source and the resulting `max_io_bytes`. A command that the kernel refuses
@@ -141,8 +175,12 @@ nixl_xnvme_nvm_test --device /dev/ng0n1 --async io_uring_cmd \
 
 - One namespace per backend instance; `devId` is recorded, not a device
   selector.
-- No fixed or dma-buf buffers, no GPU memory, no metadata/PI, no Write
-  Zeroes, Copy or Dataset Management.
+- `VRAM_SEG` is accepted only in `dmabuf` mode, as a dma-buf whose base is
+  the device pointer; no other GPU path. No metadata/PI, no Write Zeroes,
+  Copy or Dataset Management.
+- Registered modes: at most 256 buffers per backend instance, one io_uring
+  ring per instance, no passthrough (the kernel cannot import registered
+  buffers for `URING_CMD`).
 - Caller progress only.
 - Write completion is not a durability guarantee: no Flush or FUA is
   issued.

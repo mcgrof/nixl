@@ -46,7 +46,7 @@ createStaticXNVME_NVMPlugin() {
                                       "XNVME_NVM",
                                       "0.1.0",
                                       get_xnvme_nvm_backend_options(),
-                                      {DRAM_SEG, BLK_SEG});
+                                      {DRAM_SEG, VRAM_SEG, BLK_SEG});
 }
 
 #else
@@ -57,7 +57,7 @@ nixl_plugin_init() {
                                       "XNVME_NVM",
                                       "0.1.0",
                                       get_xnvme_nvm_backend_options(),
-                                      {DRAM_SEG, BLK_SEG});
+                                      {DRAM_SEG, VRAM_SEG, BLK_SEG});
 }
 
 extern "C" NIXL_PLUGIN_EXPORT void
