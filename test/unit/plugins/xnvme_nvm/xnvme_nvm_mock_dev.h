@@ -59,6 +59,8 @@ public:
     uint8_t forcedSct = 0;
     int64_t shortBy = 0; // >0 with reportsBytes: report that many bytes fewer
     bool holdCompletions = false; // poke() completes nothing while set
+    int pokeErrorBudget = 0; // fail this many poke calls with pokeError
+    int pokeError = -EIO;
 
     // --- observability ---
     std::vector<uint8_t> store;
@@ -170,6 +172,10 @@ public:
     int
     poke() override {
         pokeCount++;
+        if (pokeErrorBudget > 0) {
+            pokeErrorBudget--;
+            return pokeError;
+        }
         if (holdCompletions) {
             return 0;
         }

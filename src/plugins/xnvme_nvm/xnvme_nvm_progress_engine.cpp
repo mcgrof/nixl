@@ -174,7 +174,11 @@ nixlXnvmeNvmProgressEngine::progress() const {
 
     int did = dev_->poke();
     if (did < 0) {
+        if (did == -EAGAIN || did == -EINTR || did == -EBUSY) {
+            return 0;
+        }
         NIXL_ERROR << "XNVME_NVM: queue poke failed: " << did;
+        queueError_ = did;
     }
 
     for (auto it = cancelledRequests_.begin(); it != cancelledRequests_.end();) {
@@ -191,6 +195,10 @@ nixlXnvmeNvmProgressEngine::progress() const {
 void
 nixlXnvmeNvmProgressEngine::tryResumePendingRequests() const {
     std::lock_guard<std::mutex> guard(lock_);
+
+    if (queueError_) {
+        return;
+    }
 
     while (!pendingRequests_.empty()) {
         nixlXnvmeNvmBackendReqH *req_h = pendingRequests_.front();
@@ -210,6 +218,15 @@ nixlXnvmeNvmProgressEngine::checkXfer(nixlXnvmeNvmBackendReqH *req_h) const {
         return NIXL_ERR_INVALID_PARAM;
     }
     progress();
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        if (queueError_) {
+            if (req_h->overallStatus_ == NIXL_IN_PROG) {
+                req_h->overallStatus_ = NIXL_ERR_BACKEND;
+            }
+            return NIXL_ERR_BACKEND;
+        }
+    }
     tryResumePendingRequests();
     if (req_h->allTasksCompleted()) {
         return req_h->getOverallStatus();
@@ -221,6 +238,11 @@ nixl_status_t
 nixlXnvmeNvmProgressEngine::postXfer(nixlXnvmeNvmBackendReqH *req_h,
                                      nixl_xfer_op_t operation) const {
     std::lock_guard<std::mutex> guard(lock_);
+
+    if (queueError_) {
+        req_h->overallStatus_ = NIXL_ERR_BACKEND;
+        return NIXL_ERR_BACKEND;
+    }
 
     // Reset for (re)post: the same handle may be posted again after DONE.
     req_h->op_ = operation;
@@ -240,7 +262,17 @@ nixlXnvmeNvmProgressEngine::postXfer(nixlXnvmeNvmBackendReqH *req_h,
     // may fire inline here.
     int rc = dev_->poke();
     if (rc < 0) {
-        NIXL_ERROR << "XNVME_NVM: queue poke failed: " << rc;
+        if (rc == -EAGAIN || rc == -EINTR || rc == -EBUSY) {
+            rc = 0;
+        } else {
+            NIXL_ERROR << "XNVME_NVM: queue poke failed: " << rc;
+            queueError_ = rc;
+            req_h->overallStatus_ = NIXL_ERR_BACKEND;
+        }
+    }
+
+    if (queueError_) {
+        return NIXL_ERR_BACKEND;
     }
 
     if (!done) {

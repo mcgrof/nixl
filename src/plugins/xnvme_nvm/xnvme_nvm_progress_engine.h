@@ -87,6 +87,9 @@ private:
     mutable std::deque<nixlXnvmeNvmBackendReqH *> pendingRequests_;
     // Cancelled requests with commands still in flight; freed by progress().
     mutable std::vector<nixlXnvmeNvmBackendReqH *> cancelledRequests_;
+    // A permanent queue-level error makes every active and future request
+    // fail closed. Their storage remains alive until accepted commands drain.
+    mutable int queueError_ = 0;
     mutable nixlXnvmeNvmStats stats_;
 };
 

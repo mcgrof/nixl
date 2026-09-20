@@ -728,6 +728,27 @@ TEST(XnvmeNvmXfer, PartialSubmissionThenPermanentFailure) {
     EXPECT_EQ(s.bytesOkWrite, 2u * 4096u);
 }
 
+TEST(XnvmeNvmXfer, PermanentQueueErrorFailsInsteadOfStayingInProgress) {
+    EngineMaker maker;
+    maker.configureMock = [](nixlXnvmeNvmMockDev &m) { m.pokeErrorBudget = 1; };
+    auto engine = maker.make();
+    XferHarness h(*engine, 2, 4096);
+    EXPECT_EQ(h.run(NIXL_WRITE), NIXL_ERR_BACKEND);
+    XferHarness later(*engine, 1, 4096);
+    EXPECT_EQ(later.run(NIXL_WRITE), NIXL_ERR_BACKEND);
+}
+
+TEST(XnvmeNvmXfer, TransientQueueErrorRetries) {
+    EngineMaker maker;
+    maker.configureMock = [](nixlXnvmeNvmMockDev &m) {
+        m.pokeErrorBudget = 1;
+        m.pokeError = -EINTR;
+    };
+    auto engine = maker.make();
+    XferHarness h(*engine, 2, 4096);
+    EXPECT_EQ(h.run(NIXL_WRITE), NIXL_SUCCESS);
+}
+
 TEST(XnvmeNvmXfer, CompletionFailureIsBackendError) {
     EngineMaker maker;
     maker.configureMock = [](nixlXnvmeNvmMockDev &m) { m.forceCplError = true; };
