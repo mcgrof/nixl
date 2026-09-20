@@ -139,6 +139,19 @@ public:
         xopts.rdwr = 1;
         xopts.direct = opts.direct ? 1 : 0;
 
+        // xNVMe's default Linux admin interface issues NVMe ioctls. A
+        // regular file (and a non-NVMe block device) instead needs the
+        // file_as_ns identify shim to populate capacity and 512-byte LBA
+        // geometry. Without it xnvme_dev_open() can return a handle whose
+        // geometry is all zeroes, making the documented file path unusable.
+        struct stat path_stat;
+        std::string sysfs_ctrl, sysfs_ns;
+        if (stat(uri.c_str(), &path_stat) == 0 &&
+            (S_ISREG(path_stat.st_mode) ||
+             (S_ISBLK(path_stat.st_mode) && !sysfsNamesFor(uri, sysfs_ctrl, sysfs_ns)))) {
+            xopts.admin = "file_as_ns";
+        }
+
         dev_ = xnvme_dev_open(uri.c_str(), &xopts);
         if (!dev_) {
             NIXL_ERROR << "XNVME_NVM: xnvme_dev_open(" << uri << ", async=" << async_

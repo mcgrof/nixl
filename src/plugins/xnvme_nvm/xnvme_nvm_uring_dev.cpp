@@ -282,14 +282,21 @@ public:
             up.data = reinterpret_cast<uint64_t>(&desc);
             up.nr = 1;
             err = uringRegister(ring_.ring_fd, IORING_REGISTER_BUFFERS_UPDATE, &up, sizeof(up));
-            dmabufSlots_.erase(slot);
         } else {
             struct iovec iov = {nullptr, 0};
             __u64 tag = 0;
             err = io_uring_register_buffers_update_tag(&ring_, slot, &iov, &tag, 1);
         }
+
+        // A failed update leaves the old registration installed. Keep the
+        // slot occupied so a later registration cannot alias it and so the
+        // caller can retry the teardown.
+        if (err < 0) {
+            return err;
+        }
+        dmabufSlots_.erase(slot);
         freeSlot(slot);
-        return err < 0 ? err : 0;
+        return 0;
     }
 
     int
@@ -305,12 +312,25 @@ public:
 
     int
     poke() override {
+        int submit_err = 0;
         if (pendingSqes_ > 0) {
             int rc = io_uring_submit(&ring_);
             if (rc < 0) {
-                return rc;
+                submit_err = rc;
+            } else {
+                // io_uring_submit() is allowed to submit only a prefix. The
+                // rest remain in liburing's SQ and must be retried on the
+                // next poke rather than being forgotten.
+                const uint32_t submitted = static_cast<uint32_t>(rc);
+                if (submitted > pendingSqes_) {
+                    NIXL_ERROR << "XNVME_NVM(uring): io_uring_submit returned " << submitted
+                               << " for " << pendingSqes_ << " pending SQEs";
+                    submit_err = -EIO;
+                    pendingSqes_ = 0;
+                } else {
+                    pendingSqes_ -= submitted;
+                }
             }
-            pendingSqes_ = 0;
         }
         int completed = 0;
         struct io_uring_cqe *cqe;
@@ -332,7 +352,10 @@ public:
                 cplCb_(cookie, cpl);
             }
         }
-        return completed;
+        // Even when submission failed, always reap completions first: they
+        // may free queue capacity and make the next submission attempt
+        // succeed. Preserve the error only when no progress was made.
+        return completed > 0 ? completed : submit_err;
     }
 
     uint32_t
@@ -364,7 +387,10 @@ private:
 
     int
     submit(bool write, uint64_t slba, uint16_t nlb, void *buf, uint32_t slot, void *cookie) {
-        if (inflight_ + pendingSqes_ >= capacity_) {
+        // inflight_ includes both SQEs waiting in liburing and commands
+        // already submitted to the kernel. Adding pendingSqes_ here would
+        // count queued commands twice and cut the usable queue depth in half.
+        if (inflight_ >= capacity_) {
             statSaturated_++;
             return -EAGAIN;
         }

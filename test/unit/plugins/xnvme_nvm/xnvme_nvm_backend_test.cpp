@@ -598,6 +598,8 @@ TEST(XnvmeNvmRegister, BlkRangeChecks) {
     // Whole namespace (len 0) and an exact-fit range are fine.
     EXPECT_EQ(engine->registerMem(nixlBlobDesc(0, 0, 1, ""), BLK_SEG, md), NIXL_SUCCESS);
     engine->deregisterMem(md);
+    EXPECT_EQ(engine->registerMem(nixlBlobDesc(4096, 0, 1, ""), BLK_SEG, md),
+              NIXL_ERR_INVALID_PARAM);
     EXPECT_EQ(engine->registerMem(nixlBlobDesc(cap - 4096, 4096, 1, ""), BLK_SEG, md),
               NIXL_SUCCESS);
     engine->deregisterMem(md);
@@ -628,14 +630,16 @@ TEST(XnvmeNvmQuery, InsideRangesAreAccessibleOutsideAreNot) {
     descs.addDesc(nixlBlobDesc(0, 4096, 0, ""));
     descs.addDesc(nixlBlobDesc(cap, 4096, 1, ""));
     descs.addDesc(nixlBlobDesc(0, 0, 2, "/dev/other"));
+    descs.addDesc(nixlBlobDesc(4096, 0, 3, ""));
     std::vector<nixl_query_resp_t> resp;
     ASSERT_EQ(engine->queryMem(descs, resp), NIXL_SUCCESS);
-    ASSERT_EQ(resp.size(), 3u);
+    ASSERT_EQ(resp.size(), 4u);
     ASSERT_TRUE(resp[0].has_value());
     EXPECT_EQ(resp[0]->at("serial"), "MOCK0");
     EXPECT_EQ(resp[0]->at("lba_bytes"), "512");
     EXPECT_FALSE(resp[1].has_value());
     EXPECT_FALSE(resp[2].has_value());
+    EXPECT_FALSE(resp[3].has_value());
     EXPECT_EQ(maker.mock->submitAttempts, 0);
 }
 
@@ -687,7 +691,7 @@ TEST(XnvmeNvmXfer, QueueDepthExhaustionParksAndResumes) {
     EXPECT_EQ(h.run(NIXL_WRITE), NIXL_SUCCESS);
     EXPECT_GT(engine->stats().submitParked, 0u);
     EXPECT_EQ(engine->stats().cmdsSubmitted, 9u);
-    EXPECT_LE(engine->stats().maxInflight, 2u);
+    EXPECT_EQ(engine->stats().maxInflight, 2u);
 }
 
 TEST(XnvmeNvmXfer, EagainBudgetRetries) {

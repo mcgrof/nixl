@@ -160,10 +160,10 @@ nixlXnvmeNvmProgressEngine::trySubmitRequest(nixlXnvmeNvmBackendReqH *req_h) con
         stats_.cmdsSubmitted++;
         req_h->submittedTasks_++;
         req_h->nextTask_ = t + 1;
-    }
-    const uint32_t inflight = dev_->outstanding();
-    if (inflight > stats_.maxInflight) {
-        stats_.maxInflight = inflight;
+        const uint32_t inflight = dev_->outstanding();
+        if (inflight > stats_.maxInflight) {
+            stats_.maxInflight = inflight;
+        }
     }
     return true;
 }

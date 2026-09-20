@@ -460,6 +460,10 @@ nixlXnvmeNvmEngine::registerMem(const nixlBlobDesc &mem,
                    << " is not a multiple of the " << g.lbaBytes << "-byte logical block";
         return NIXL_ERR_INVALID_PARAM;
     }
+    if (mem.len == 0 && mem.addr != 0) {
+        NIXL_ERROR << "XNVME_NVM: an unbounded BLK_SEG registration must start at offset 0";
+        return NIXL_ERR_INVALID_PARAM;
+    }
     if (mem.addr >= g.capacityBytes || mem.len > g.capacityBytes - mem.addr) {
         NIXL_ERROR << "XNVME_NVM: BLK_SEG range offset=" << mem.addr << " len=" << mem.len
                    << " exceeds the namespace capacity of " << g.capacityBytes << " bytes";
@@ -512,8 +516,8 @@ nixlXnvmeNvmEngine::queryMem(const nixl_reg_dlist_t &descs,
             resp.emplace_back(nixl_b_params_t{});
             continue;
         }
-        const bool inside = d.addr < g.capacityBytes && d.len <= g.capacityBytes - d.addr &&
-            (d.metaInfo.empty() || d.metaInfo == deviceName_);
+        const bool inside = (d.len != 0 || d.addr == 0) && d.addr < g.capacityBytes &&
+            d.len <= g.capacityBytes - d.addr && (d.metaInfo.empty() || d.metaInfo == deviceName_);
         if (!inside) {
             resp.emplace_back(std::nullopt);
             continue;

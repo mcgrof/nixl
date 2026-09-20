@@ -31,6 +31,7 @@ get_xnvme_nvm_backend_options() {
         {"expect_serial", ""},
         {"expect_wwid", ""},
         {"buffer_mode", "host"},
+        {"max_dmabuf_bytes", "1073741824"},
     };
     return options;
 }
