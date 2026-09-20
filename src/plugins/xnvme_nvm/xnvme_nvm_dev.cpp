@@ -16,9 +16,11 @@
  */
 #include "xnvme_nvm_dev.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -119,6 +121,38 @@ devKindName(devKind kind) {
     }
 }
 
+void
+setDirectAlignments(const std::string &uri,
+                    const struct stat &st,
+                    bool direct,
+                    nixlXnvmeNvmGeo &geo) {
+    geo.memAlignBytes = geo.lbaBytes;
+    geo.offsetAlignBytes = geo.lbaBytes;
+    if (!direct || !S_ISREG(st.st_mode)) {
+        return;
+    }
+
+    // statx reports the actual filesystem O_DIRECT contract. st_blksize is
+    // only a conservative fallback when STATX_DIOALIGN is unavailable.
+    const uint32_t fallback = static_cast<uint32_t>(
+        std::max<uint64_t>(geo.lbaBytes, st.st_blksize > 0 ? st.st_blksize : geo.lbaBytes));
+    geo.memAlignBytes = fallback;
+    geo.offsetAlignBytes = fallback;
+#ifdef STATX_DIOALIGN
+    struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+    if (statx(AT_FDCWD, uri.c_str(), AT_STATX_DONT_SYNC, STATX_DIOALIGN, &stx) == 0 &&
+        (stx.stx_mask & STATX_DIOALIGN)) {
+        if (stx.stx_dio_mem_align) {
+            geo.memAlignBytes = stx.stx_dio_mem_align;
+        }
+        if (stx.stx_dio_offset_align) {
+            geo.offsetAlignBytes = stx.stx_dio_offset_align;
+        }
+    }
+#endif
+}
+
 class nixlXnvmeNvmRealDev : public nixlXnvmeNvmDevIface {
 public:
     nixlXnvmeNvmRealDev() = default;
@@ -197,16 +231,11 @@ public:
             return NIXL_ERR_BACKEND;
         }
 
-        const struct xnvme_spec_idfy_ctrlr *ctrlr = xnvme_dev_get_ctrlr(dev_);
-        if (ctrlr && ctrlr->mdts) {
-            // MDTS is a power of two of the 4 KiB minimum page size; anything
-            // that would overflow 32 bits is effectively unbounded here.
-            const unsigned shift = ctrlr->mdts + 12;
-            geo_.idfyMdtsBytes = shift >= 32 ? UINT32_MAX : (1u << shift);
-        }
-
         const long page = sysconf(_SC_PAGESIZE);
         geo_.pageBytes = page > 0 ? static_cast<uint32_t>(page) : 4096u;
+        if (stat(uri.c_str(), &path_stat) == 0) {
+            setDirectAlignments(uri, path_stat, opts.direct, geo_);
+        }
 
         std::string ctrl, ns;
         if (sysfsNamesFor(uri, ctrl, ns)) {

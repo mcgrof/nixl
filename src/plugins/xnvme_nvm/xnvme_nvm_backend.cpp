@@ -121,7 +121,6 @@ nixlXnvmeNvmEngine::computeMaxIoBytes(const nixlXnvmeNvmGeo &geo,
             limit = candidate;
         }
     };
-    fold(geo.idfyMdtsBytes);
     fold(static_cast<uint64_t>(65536) * geo.lbaBytes);
     // A dma-buf backed bio has its own hardware ceiling on kernels that
     // carry the rw-dmabuf series; without the knob it is bounded like any
@@ -139,12 +138,18 @@ nixlXnvmeNvmEngine::computeMaxIoBytes(const nixlXnvmeNvmGeo &geo,
         fold(static_cast<uint64_t>(geo.sysfsMaxSegments) * geo.pageBytes);
     }
     fold(user_max_io_bytes);
-    // The NLB term is never zero, so a ceiling always exists.
-    limit -= limit % geo.lbaBytes;
-    if (limit < geo.lbaBytes) {
-        limit = geo.lbaBytes;
+    // Every command must preserve both the device LBA unit and the direct-I/O
+    // address/offset alignment reported by the target filesystem.
+    const uint32_t alignment =
+        std::max({geo.lbaBytes,
+                  geo.memAlignBytes ? geo.memAlignBytes : geo.lbaBytes,
+                  geo.offsetAlignBytes ? geo.offsetAlignBytes : geo.lbaBytes});
+    limit = std::min<uint64_t>(limit, UINT32_MAX);
+    limit -= limit % alignment;
+    if (limit < alignment) {
+        return 0;
     }
-    return static_cast<uint32_t>(std::min<uint64_t>(limit, UINT32_MAX));
+    return static_cast<uint32_t>(limit);
 }
 
 nixlXnvmeNvmEngine::nixlXnvmeNvmEngine(const nixlBackendInitParams *init_params,
@@ -183,8 +188,9 @@ nixlXnvmeNvmEngine::nixlXnvmeNvmEngine(const nixlBackendInitParams *init_params,
               << " direct=" << (direct_ ? "true" : "false") << " dev_type=" << g.devType
               << " nsid=" << g.nsid << " serial='" << g.serial << "' model='" << g.model
               << "' firmware='" << g.firmware << "' wwid='" << g.wwid
-              << "' lba_bytes=" << g.lbaBytes << " capacity_bytes=" << g.capacityBytes
-              << " idfy_mdts_bytes=" << g.idfyMdtsBytes << " xnvme_mdts_bytes=" << g.xnvmeMdtsBytes
+              << "' lba_bytes=" << g.lbaBytes << " mem_align_bytes=" << g.memAlignBytes
+              << " offset_align_bytes=" << g.offsetAlignBytes
+              << " capacity_bytes=" << g.capacityBytes << " xnvme_mdts_bytes=" << g.xnvmeMdtsBytes
               << " sysfs_max_hw_bytes=" << g.sysfsMaxHwBytes
               << " sysfs_max_segments=" << g.sysfsMaxSegments
               << " sysfs_max_hw_dmabuf_bytes=" << g.sysfsMaxHwDmabufBytes
@@ -366,15 +372,24 @@ nixlXnvmeNvmEngine::initDevice() {
         return NIXL_ERR_NOT_SUPPORTED;
     }
     maxIoBytes_ = computeMaxIoBytes(g, async_ == "io_uring_cmd", bufferMode_, userMaxIoBytes_);
+    if (maxIoBytes_ == 0) {
+        NIXL_ERROR << "XNVME_NVM: max_io_bytes is smaller than the target's direct-I/O alignment";
+        dev_->close();
+        return NIXL_ERR_INVALID_PARAM;
+    }
     if (forceMaxIoBytes_) {
         // The NLB field is an encoding limit; everything else in the
         // ceiling is a limit the kernel or device enforces at its end, and
         // a caller with physically contiguous buffers may choose to test it.
         const uint64_t nlb_limit = static_cast<uint64_t>(65536) * g.lbaBytes;
-        uint64_t forced = forceMaxIoBytes_ - forceMaxIoBytes_ % g.lbaBytes;
+        const uint32_t alignment = std::max({g.lbaBytes,
+                                             g.memAlignBytes ? g.memAlignBytes : g.lbaBytes,
+                                             g.offsetAlignBytes ? g.offsetAlignBytes : g.lbaBytes});
+        uint64_t forced = forceMaxIoBytes_ - forceMaxIoBytes_ % alignment;
         if (forced == 0 || forced > nlb_limit) {
             NIXL_ERROR << "XNVME_NVM: max_io_bytes_force=" << forceMaxIoBytes_ << " is outside (0, "
-                       << nlb_limit << "] for a " << g.lbaBytes << "-byte logical block";
+                       << nlb_limit << "] or below the " << alignment
+                       << "-byte direct-I/O alignment";
             dev_->close();
             return NIXL_ERR_INVALID_PARAM;
         }
@@ -413,6 +428,14 @@ nixlXnvmeNvmEngine::registerMem(const nixlBlobDesc &mem,
         }
         if (mem.len == 0) {
             NIXL_ERROR << "XNVME_NVM: a registered buffer needs a non-zero length";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        const nixlXnvmeNvmGeo &g = dev_->geo();
+        const uint32_t alignment = g.memAlignBytes ? g.memAlignBytes : g.lbaBytes;
+        if (mem.addr % alignment != 0 || mem.len % alignment != 0) {
+            NIXL_ERROR << "XNVME_NVM: registered buffer addr=0x" << std::hex << mem.addr
+                       << " len=0x" << mem.len << std::dec << " is not aligned to " << alignment
+                       << " bytes";
             return NIXL_ERR_INVALID_PARAM;
         }
         uint32_t slot = XNVME_NVM_NO_SLOT;
@@ -455,9 +478,11 @@ nixlXnvmeNvmEngine::registerMem(const nixlBlobDesc &mem,
                    << "' but this backend opened '" << deviceName_ << "'";
         return NIXL_ERR_INVALID_PARAM;
     }
-    if (mem.addr % g.lbaBytes != 0 || mem.len % g.lbaBytes != 0) {
+    const uint32_t alignment = g.offsetAlignBytes ? g.offsetAlignBytes : g.lbaBytes;
+    if (mem.addr % alignment != 0 || mem.len % alignment != 0) {
         NIXL_ERROR << "XNVME_NVM: BLK_SEG range offset=" << mem.addr << " len=" << mem.len
-                   << " is not a multiple of the " << g.lbaBytes << "-byte logical block";
+                   << " is not a multiple of the " << alignment
+                   << "-byte direct-I/O offset alignment";
         return NIXL_ERR_INVALID_PARAM;
     }
     if (mem.len == 0 && mem.addr != 0) {
@@ -524,11 +549,14 @@ nixlXnvmeNvmEngine::queryMem(const nixl_reg_dlist_t &descs,
         }
         // No device command: conventional NVM has no existence query; the
         // answer is the namespace identity and geometry.
-        resp.emplace_back(nixl_b_params_t{{"serial", g.serial},
-                                          {"wwid", g.wwid},
-                                          {"capacity_bytes", std::to_string(g.capacityBytes)},
-                                          {"lba_bytes", std::to_string(g.lbaBytes)},
-                                          {"max_io_bytes", std::to_string(maxIoBytes_)}});
+        resp.emplace_back(
+            nixl_b_params_t{{"serial", g.serial},
+                            {"wwid", g.wwid},
+                            {"capacity_bytes", std::to_string(g.capacityBytes)},
+                            {"lba_bytes", std::to_string(g.lbaBytes)},
+                            {"mem_align_bytes", std::to_string(g.memAlignBytes)},
+                            {"offset_align_bytes", std::to_string(g.offsetAlignBytes)},
+                            {"max_io_bytes", std::to_string(maxIoBytes_)}});
     }
     return NIXL_SUCCESS;
 }
@@ -573,6 +601,9 @@ nixlXnvmeNvmEngine::prepXfer(const nixl_xfer_op_t &operation,
 
     const nixlXnvmeNvmGeo &g = dev_->geo();
     const uint32_t lba = g.lbaBytes;
+    const uint32_t mem_align = g.memAlignBytes ? g.memAlignBytes : lba;
+    const uint32_t offset_align = g.offsetAlignBytes ? g.offsetAlignBytes : lba;
+    const uint32_t len_align = std::max({lba, mem_align, offset_align});
     auto req_h = std::make_unique<nixlXnvmeNvmBackendReqH>();
 
     // First pass: validate and count commands, so the task vector is sized
@@ -590,10 +621,11 @@ nixlXnvmeNvmEngine::prepXfer(const nixl_xfer_op_t &operation,
             NIXL_ERROR << "XNVME_NVM: descriptor " << i << " has zero length";
             return NIXL_ERR_INVALID_PARAM;
         }
-        if (l.addr % lba != 0 || r.addr % lba != 0 || l.len % lba != 0) {
+        if (l.addr % mem_align != 0 || r.addr % offset_align != 0 || l.len % len_align != 0) {
             NIXL_ERROR << "XNVME_NVM: descriptor " << i << " (host=0x" << std::hex << l.addr
                        << " offset=0x" << r.addr << " len=0x" << l.len << std::dec
-                       << ") is not aligned to the " << lba << "-byte logical block";
+                       << ") violates direct-I/O alignment (memory=" << mem_align
+                       << ", offset=" << offset_align << ", length=" << len_align << ")";
             return NIXL_ERR_INVALID_PARAM;
         }
         if (r.addr >= g.capacityBytes || r.len > g.capacityBytes - r.addr) {

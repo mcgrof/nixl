@@ -209,10 +209,10 @@ public:
     stats() const;
 
     // The ceiling rule, exposed for tests: the smallest non-zero of the
-    // Identify MDTS, the 16-bit NLB field (always present), the kernel's
+    // 16-bit NLB field (always present), the kernel's
     // max_hw_sectors_kb (max_hw_dmabuf_sectors_kb for dma-buf payloads),
     // for passthrough the kernel's max_segments worth of host pages, and
-    // the user's max_io_bytes, rounded down to a logical block.
+    // the user's max_io_bytes, rounded down to the direct-I/O alignment.
     static uint32_t
     computeMaxIoBytes(const nixlXnvmeNvmGeo &geo,
                       bool passthrough,

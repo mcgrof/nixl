@@ -30,13 +30,14 @@ descriptor addresses an offset, not a key.
   partial success.
 - `queryMem` on a `BLK_SEG` list issues no command: a range inside the
   namespace is reported accessible with `serial`, `wwid`, `capacity_bytes`,
-  `lba_bytes` and `max_io_bytes`; a range outside it is reported absent.
+  `lba_bytes`, `mem_align_bytes`, `offset_align_bytes` and `max_io_bytes`; a
+  range outside it is reported absent.
 
 ## Command formation
 
 Each descriptor is split into commands of at most `max_io_bytes`, the
-smallest of: the controller's Identify MDTS, the 16-bit NLB field
-(`65536 * lba_bytes`), the kernel's `max_hw_sectors_kb` for the namespace
+smallest of: the 16-bit NLB field (`65536 * lba_bytes`), the kernel's
+`max_hw_sectors_kb` for the namespace
 (read from sysfs when the path is `/dev/ngXnY` or `/dev/nvmeXnY`), for
 passthrough the kernel's `max_segments` times the host page size, and the
 `max_io_bytes` parameter. The segment term exists because a passthrough
@@ -44,11 +45,14 @@ command maps the host buffer as it is and the kernel rejects one that
 needs more segments than the queue allows (`EINVAL`) instead of splitting
 it; an ordinary host buffer can need one segment per page, so a larger
 command only succeeds when the pages happen to be physically contiguous.
-The block paths split and merge in the kernel, so there the device may see
-commands both smaller and larger than `max_io_bytes`. xNVMe's own
-`geo.mdts_nbytes` is logged but not used: for the `nvme` sync interface it
-is capped to `(max_segments - 1) * physical_block_size`, a segment model
-rather than a device or kernel limit.
+The Linux queue limit already incorporates the controller's MDTS without
+guessing CAP.MPSMIN. The block paths split and merge in the kernel, so there
+the device may see commands both smaller and larger than `max_io_bytes`.
+xNVMe's own `geo.mdts_nbytes` is logged but not used: for the `nvme` sync
+interface it is capped to `(max_segments - 1) * physical_block_size`, a
+segment model rather than a device or kernel limit. For regular files the
+command length and both addresses additionally follow the filesystem's
+`STATX_DIOALIGN` contract (or a conservative `st_blksize` fallback).
 
 A request completes when every command of every descriptor has completed.
 A failed command fails the request but the remaining in-flight commands

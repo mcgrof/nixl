@@ -16,6 +16,7 @@
  */
 #include "xnvme_nvm_dev.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <map>
@@ -47,6 +48,33 @@ namespace {
 using nixl_xnvme_nvm::readSysfs;
 using nixl_xnvme_nvm::readSysfsNumber;
 using nixl_xnvme_nvm::sysfsNamesFor;
+
+void
+setDirectAlignments(int fd, const struct stat &st, bool direct, nixlXnvmeNvmGeo &geo) {
+    geo.memAlignBytes = geo.lbaBytes;
+    geo.offsetAlignBytes = geo.lbaBytes;
+    if (!direct || !S_ISREG(st.st_mode)) {
+        return;
+    }
+
+    const uint32_t fallback = static_cast<uint32_t>(
+        std::max<uint64_t>(geo.lbaBytes, st.st_blksize > 0 ? st.st_blksize : geo.lbaBytes));
+    geo.memAlignBytes = fallback;
+    geo.offsetAlignBytes = fallback;
+#ifdef STATX_DIOALIGN
+    struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+    if (statx(fd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_DIOALIGN, &stx) == 0 &&
+        (stx.stx_mask & STATX_DIOALIGN)) {
+        if (stx.stx_dio_mem_align) {
+            geo.memAlignBytes = stx.stx_dio_mem_align;
+        }
+        if (stx.stx_dio_offset_align) {
+            geo.offsetAlignBytes = stx.stx_dio_offset_align;
+        }
+    }
+#endif
+}
 
 // Mirrors of include/uapi/linux/io_uring.h at rw-dmabuf-v6 / v7.3-rc3:
 // io_uring_rsrc_update2 with the flags word, and the extended descriptor.
@@ -136,6 +164,7 @@ public:
         geo_.nsid = 1;
         const long page = sysconf(_SC_PAGESIZE);
         geo_.pageBytes = page > 0 ? static_cast<uint32_t>(page) : 4096u;
+        setDirectAlignments(fd_, st, opts.direct, geo_);
 
         std::string ctrl, ns;
         if (sysfsNamesFor(uri, ctrl, ns)) {

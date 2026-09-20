@@ -36,11 +36,12 @@ public:
     // --- geometry knobs (read at open) ---
     uint32_t lbaBytes = 512;
     uint64_t capacityBytes = 64 * 1024 * 1024;
-    uint32_t idfyMdtsBytes = 0;
     uint32_t sysfsMaxHwBytes = 0;
     uint32_t sysfsMaxSegments = 0;
     uint32_t sysfsMaxHwDmabufBytes = 0;
     uint32_t pageBytes = 4096;
+    uint32_t memAlignBytes = 512;
+    uint32_t offsetAlignBytes = 512;
     bool registration = false; // advertise registered-buffer support
     uint32_t maxSlots = 8;
     std::string serial = "MOCK0";
@@ -88,12 +89,12 @@ public:
         geo_.nsid = opts.nsidOverride ? opts.nsidOverride : 1;
         geo_.lbaBytes = lbaBytes;
         geo_.capacityBytes = capacityBytes;
-        geo_.idfyMdtsBytes = idfyMdtsBytes;
-        geo_.xnvmeMdtsBytes = idfyMdtsBytes;
         geo_.sysfsMaxHwBytes = sysfsMaxHwBytes;
         geo_.sysfsMaxSegments = sysfsMaxSegments;
         geo_.sysfsMaxHwDmabufBytes = sysfsMaxHwDmabufBytes;
         geo_.pageBytes = pageBytes;
+        geo_.memAlignBytes = memAlignBytes;
+        geo_.offsetAlignBytes = offsetAlignBytes;
         geo_.serial = serial;
         geo_.model = "mock";
         geo_.firmware = "0";

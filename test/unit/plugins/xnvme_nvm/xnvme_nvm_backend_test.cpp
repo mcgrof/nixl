@@ -215,14 +215,13 @@ private:
 TEST(XnvmeNvmCeiling, SmallestNonZeroSourceWins) {
     nixlXnvmeNvmGeo g;
     g.lbaBytes = 512;
-    g.idfyMdtsBytes = 2u << 20;
     g.sysfsMaxHwBytes = 128u << 10;
     EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
               128u << 10);
     EXPECT_EQ(
         nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 64u << 10),
         64u << 10);
-    g.sysfsMaxHwBytes = 0;
+    g.sysfsMaxHwBytes = 2u << 20;
     EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
               2u << 20);
 }
@@ -230,24 +229,22 @@ TEST(XnvmeNvmCeiling, SmallestNonZeroSourceWins) {
 TEST(XnvmeNvmCeiling, NlbFieldAlwaysCaps) {
     nixlXnvmeNvmGeo g;
     g.lbaBytes = 512;
-    g.idfyMdtsBytes = UINT32_MAX; // unbounded MDTS
     EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
               65536u * 512u);
-    g.idfyMdtsBytes = 0; // not reported at all: the NLB field still bounds it
-    EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 0),
-              65536u * 512u);
-    // Rounded down to a whole block, never below one block.
+    // Rounded down to a whole direct-I/O unit; a smaller explicit ceiling
+    // cannot produce a legal command.
     g.lbaBytes = 4096;
+    g.memAlignBytes = 4096;
+    g.offsetAlignBytes = 4096;
     EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 5000),
               4096u);
     EXPECT_EQ(nixlXnvmeNvmEngine::computeMaxIoBytes(g, false, nixlXnvmeNvmBufferMode::host, 100),
-              4096u);
+              0u);
 }
 
 TEST(XnvmeNvmCeiling, PassthroughIsBoundedBySegmentsTimesPages) {
     nixlXnvmeNvmGeo g;
     g.lbaBytes = 512;
-    g.idfyMdtsBytes = 2u << 20;
     g.sysfsMaxHwBytes = 2u << 20;
     g.sysfsMaxSegments = 128;
     g.pageBytes = 4096;
@@ -265,7 +262,7 @@ TEST(XnvmeNvmCeiling, PassthroughIsBoundedBySegmentsTimesPages) {
 TEST(XnvmeNvmParams, PassthroughCeilingUsesTheSegmentLimit) {
     EngineMaker maker({{"device_name", "/dev/mock0"}, {"async", "io_uring_cmd"}});
     maker.configureMock = [](nixlXnvmeNvmMockDev &m) {
-        m.idfyMdtsBytes = 2u << 20;
+        m.sysfsMaxHwBytes = 2u << 20;
         m.sysfsMaxSegments = 33;
         m.pageBytes = 4096;
     };
@@ -282,7 +279,7 @@ TEST(XnvmeNvmParams, ForcedCeilingOverridesButNotBeyondNlb) {
                        {"async", "io_uring_cmd"},
                        {"max_io_bytes_force", "1048576"}});
     maker.configureMock = [](nixlXnvmeNvmMockDev &m) {
-        m.idfyMdtsBytes = 2u << 20;
+        m.sysfsMaxHwBytes = 2u << 20;
         m.sysfsMaxSegments = 128;
         m.pageBytes = 4096; // computed ceiling would be 512 KiB
     };
@@ -294,6 +291,19 @@ TEST(XnvmeNvmParams, ForcedCeilingOverridesButNotBeyondNlb) {
                  std::runtime_error);
     EXPECT_THROW(EngineMaker({{"device_name", "/dev/mock0"}, {"max_io_bytes_force", "100"}}).make(),
                  std::runtime_error);
+}
+
+TEST(XnvmeNvmParams, CeilingCannotUndercutDirectIoAlignment) {
+    auto align4k = [](nixlXnvmeNvmMockDev &m) {
+        m.memAlignBytes = 4096;
+        m.offsetAlignBytes = 4096;
+    };
+    EngineMaker capped({{"device_name", "/dev/mock0"}, {"max_io_bytes", "512"}});
+    capped.configureMock = align4k;
+    EXPECT_THROW(capped.make(), std::runtime_error);
+    EngineMaker forced({{"device_name", "/dev/mock0"}, {"max_io_bytes_force", "512"}});
+    forced.configureMock = align4k;
+    EXPECT_THROW(forced.make(), std::runtime_error);
 }
 
 // --- registered buffers --------------------------------------------------------
@@ -372,7 +382,6 @@ TEST(XnvmeNvmRegistered, DmabufUsesOffsetsAndItsOwnCeiling) {
         m.dmabufBacking[42] = backing.data;
         m.sysfsMaxHwBytes = 128u << 10; // the clamp
         m.sysfsMaxHwDmabufBytes = 2u << 20; // lifted for dma-buf bios
-        m.idfyMdtsBytes = 2u << 20;
     };
     auto engine = maker.make();
     EXPECT_EQ(engine->maxIoBytes(), 2u << 20);
@@ -563,7 +572,7 @@ TEST(XnvmeNvmParams, IdentityMismatchThrowsAndMatchSucceeds) {
 
 TEST(XnvmeNvmParams, CeilingAppliedFromDeviceAndUser) {
     EngineMaker maker({{"device_name", "/dev/mock0"}, {"max_io_bytes", "65536"}});
-    maker.configureMock = [](nixlXnvmeNvmMockDev &m) { m.idfyMdtsBytes = 1u << 20; };
+    maker.configureMock = [](nixlXnvmeNvmMockDev &m) { m.sysfsMaxHwBytes = 1u << 20; };
     auto engine = maker.make();
     EXPECT_EQ(engine->maxIoBytes(), 65536u);
 }
@@ -637,6 +646,8 @@ TEST(XnvmeNvmQuery, InsideRangesAreAccessibleOutsideAreNot) {
     ASSERT_TRUE(resp[0].has_value());
     EXPECT_EQ(resp[0]->at("serial"), "MOCK0");
     EXPECT_EQ(resp[0]->at("lba_bytes"), "512");
+    EXPECT_EQ(resp[0]->at("mem_align_bytes"), "512");
+    EXPECT_EQ(resp[0]->at("offset_align_bytes"), "512");
     EXPECT_FALSE(resp[1].has_value());
     EXPECT_FALSE(resp[2].has_value());
     EXPECT_FALSE(resp[3].has_value());
@@ -797,6 +808,41 @@ TEST(XnvmeNvmXfer, PrepRejectsBadDescriptors) {
               NIXL_ERR_INVALID_PARAM);
     nixl_meta_dlist_t obj(OBJ_SEG);
     EXPECT_EQ(engine->prepXfer(NIXL_WRITE, empty_l, obj, kAgent, handle), NIXL_ERR_INVALID_PARAM);
+}
+
+TEST(XnvmeNvmXfer, DirectIoAlignmentIsStricterThanTheLba) {
+    EngineMaker maker;
+    maker.configureMock = [](nixlXnvmeNvmMockDev &m) {
+        m.memAlignBytes = 4096;
+        m.offsetAlignBytes = 4096;
+    };
+    auto engine = maker.make();
+    AlignedBuf buf(8192);
+    ASSERT_NE(buf.data, nullptr);
+    nixlBackendMD *md = nullptr;
+    ASSERT_EQ(engine->registerMem(nixlBlobDesc(0, 8192, 0, ""), BLK_SEG, md), NIXL_SUCCESS);
+
+    auto attempt = [&](uintptr_t haddr, uint64_t off, size_t len) {
+        nixl_meta_dlist_t local(DRAM_SEG), remote(BLK_SEG);
+        nixlMetaDesc l(haddr, len, 0);
+        local.addDesc(l);
+        nixlMetaDesc r(off, len, 0);
+        r.metadataP = md;
+        remote.addDesc(r);
+        nixlBackendReqH *handle = nullptr;
+        nixl_status_t st = engine->prepXfer(NIXL_WRITE, local, remote, kAgent, handle);
+        if (st == NIXL_SUCCESS) {
+            engine->releaseReqH(handle);
+        }
+        return st;
+    };
+
+    EXPECT_EQ(attempt(reinterpret_cast<uintptr_t>(buf.data), 0, 4096), NIXL_SUCCESS);
+    EXPECT_EQ(attempt(reinterpret_cast<uintptr_t>(buf.data) + 512, 0, 4096),
+              NIXL_ERR_INVALID_PARAM);
+    EXPECT_EQ(attempt(reinterpret_cast<uintptr_t>(buf.data), 512, 4096), NIXL_ERR_INVALID_PARAM);
+    EXPECT_EQ(attempt(reinterpret_cast<uintptr_t>(buf.data), 0, 512), NIXL_ERR_INVALID_PARAM);
+    engine->deregisterMem(md);
 }
 
 TEST(XnvmeNvmXfer, TransferOutsideRegistrationRejected) {

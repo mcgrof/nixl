@@ -53,12 +53,13 @@ struct nixlXnvmeNvmGeo {
     uint32_t nsid = 0;
     uint32_t lbaBytes = 0;
     uint64_t capacityBytes = 0;
-    uint32_t idfyMdtsBytes = 0; // Identify Controller MDTS in bytes; 0 = not reported
     uint32_t xnvmeMdtsBytes = 0; // xNVMe's own geo.mdts_nbytes, for the record
     uint32_t sysfsMaxHwBytes = 0; // queue/max_hw_sectors_kb * 1024; 0 = unknown
     uint32_t sysfsMaxSegments = 0; // queue/max_segments; 0 = unknown
     uint32_t sysfsMaxHwDmabufBytes = 0; // queue/max_hw_dmabuf_sectors_kb * 1024; 0 = absent
     uint32_t pageBytes = 0; // host page size, the unit of a scattered user buffer
+    uint32_t memAlignBytes = 0; // direct-I/O buffer alignment; 0 = lbaBytes
+    uint32_t offsetAlignBytes = 0; // direct-I/O offset alignment; 0 = lbaBytes
     std::string serial;
     std::string model;
     std::string firmware;
