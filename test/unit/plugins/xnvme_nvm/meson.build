@@ -40,6 +40,7 @@ if gtest_dep.found()
     xnvme_nvm_uring_unit_test = executable('xnvme_nvm_uring_dev_test',
         'xnvme_nvm_uring_dev_test.cpp',
         '../../../../src/plugins/xnvme_nvm/xnvme_nvm_dev.cpp',
+        '../../../../src/plugins/xnvme_nvm/xnvme_nvm_sysfs.cpp',
         '../../../../src/plugins/xnvme_nvm/xnvme_nvm_uring_dev.cpp',
         dependencies: [nixl_infra, nixl_common_dep, xnvme_dep, io_uring_dep, gtest_dep],
         include_directories: [nixl_inc_dirs, utils_inc_dirs,

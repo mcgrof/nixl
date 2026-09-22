@@ -24,8 +24,11 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <thread>
+
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -211,6 +214,61 @@ private:
 };
 
 // --- ceiling rule --------------------------------------------------------------
+
+// A device may legitimately be named through any of the stable aliases in
+// /dev/disk/by-id, by-uuid or by-path -- operators are usually told to
+// prefer them, since nvmeXnY is not stable across boots. sysfs is keyed by
+// the kernel name, so the alias must be resolved before it is parsed. When
+// this regressed nothing failed loudly: the lookup simply missed and the
+// device kept default geometry, silently losing MDTS, the dma-buf ceiling,
+// and the serial used to confirm which drive had been opened.
+TEST(XnvmeNvmSysfsNames, KernelNamesParse) {
+    std::string ctrl, ns;
+    ASSERT_TRUE(nixl_xnvme_nvm::sysfsNamesFor("/dev/nvme1n1", ctrl, ns));
+    EXPECT_EQ(ctrl, "nvme1");
+    EXPECT_EQ(ns, "nvme1n1");
+
+    ASSERT_TRUE(nixl_xnvme_nvm::sysfsNamesFor("/dev/ng1n1", ctrl, ns));
+    EXPECT_EQ(ctrl, "nvme1");
+    EXPECT_EQ(ns, "nvme1n1");
+}
+
+TEST(XnvmeNvmSysfsNames, NonDevicesAreRejected) {
+    std::string ctrl, ns;
+    EXPECT_FALSE(nixl_xnvme_nvm::sysfsNamesFor("/var/tmp/backing.bin", ctrl, ns));
+    // A partition is not a namespace handle; its queue limits live on the
+    // parent, so refuse it rather than read the wrong directory.
+    EXPECT_FALSE(nixl_xnvme_nvm::sysfsNamesFor("/dev/nvme0n1p2", ctrl, ns));
+    EXPECT_FALSE(nixl_xnvme_nvm::sysfsNamesFor("/dev/sda", ctrl, ns));
+}
+
+TEST(XnvmeNvmSysfsNames, StableAliasesResolveToTheKernelName) {
+    // Build a by-id-shaped link whose own basename carries a model and
+    // serial, exactly as udev names them, pointing at a kernel-named
+    // target. Only the resolved name is parseable.
+    char dir[] = "/tmp/nixl-xnvme-sysfs-XXXXXX";
+    ASSERT_NE(mkdtemp(dir), nullptr);
+    const std::string target = std::string(dir) + "/nvme7n1";
+    const std::string alias = std::string(dir) + "/nvme-SAMSUNG_MZOL63T8HDLT-00AFB_S77UNG0TC00101";
+
+    { std::ofstream(target) << "x"; }
+    ASSERT_EQ(symlink(target.c_str(), alias.c_str()), 0);
+
+    std::string ctrl, ns;
+    ASSERT_TRUE(nixl_xnvme_nvm::sysfsNamesFor(alias, ctrl, ns))
+        << "a by-id alias must resolve to its kernel name";
+    EXPECT_EQ(ctrl, "nvme7");
+    EXPECT_EQ(ns, "nvme7n1");
+
+    // The unresolved spelling must not accidentally parse.
+    std::string c2, n2;
+    EXPECT_FALSE(nixl_xnvme_nvm::sysfsNamesFor(
+        "/dev/disk/by-id/nvme-SAMSUNG_MZOL63T8HDLT-00AFB_S77UNG0TC00101", c2, n2));
+
+    unlink(alias.c_str());
+    unlink(target.c_str());
+    rmdir(dir);
+}
 
 TEST(XnvmeNvmCeiling, SmallestNonZeroSourceWins) {
     nixlXnvmeNvmGeo g;

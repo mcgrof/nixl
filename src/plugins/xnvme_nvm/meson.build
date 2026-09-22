@@ -21,6 +21,7 @@ xnvme_nvm_backend_sources = files(
     'xnvme_nvm_dev.h',
     'xnvme_nvm_progress_engine.cpp',
     'xnvme_nvm_progress_engine.h',
+    'xnvme_nvm_sysfs.cpp',
 )
 
 xnvme_nvm_sources = [

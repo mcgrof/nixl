@@ -28,52 +28,6 @@
 
 #include "common/nixl_log.h"
 
-namespace nixl_xnvme_nvm {
-
-std::string
-readSysfs(const std::string &path) {
-    std::ifstream in(path);
-    std::string value;
-    if (!in) {
-        return "";
-    }
-    std::getline(in, value);
-    while (!value.empty() && (value.back() == '\n' || value.back() == ' ')) {
-        value.pop_back();
-    }
-    return value;
-}
-
-// A sysfs decimal attribute, or 0 when absent or malformed.
-unsigned long
-readSysfsNumber(const std::string &path) {
-    const std::string text = readSysfs(path);
-    if (text.empty()) {
-        return 0;
-    }
-    char *end = nullptr;
-    const unsigned long value = strtoul(text.c_str(), &end, 10);
-    return (end && *end == '\0') ? value : 0;
-}
-
-// Map /dev/ngXnY or /dev/nvmeXnY to its controller and namespace sysfs
-// names. Anything else (files, other block devices) yields false.
-bool
-sysfsNamesFor(const std::string &uri, std::string &ctrl, std::string &ns) {
-    const size_t slash = uri.find_last_of('/');
-    const std::string base = slash == std::string::npos ? uri : uri.substr(slash + 1);
-    unsigned c = 0, n = 0;
-    char tail = 0;
-    if (sscanf(base.c_str(), "ng%un%u%c", &c, &n, &tail) == 2 ||
-        sscanf(base.c_str(), "nvme%un%u%c", &c, &n, &tail) == 2) {
-        ctrl = "nvme" + std::to_string(c);
-        ns = ctrl + "n" + std::to_string(n);
-        return true;
-    }
-    return false;
-}
-
-} // namespace nixl_xnvme_nvm
 
 namespace {
 
