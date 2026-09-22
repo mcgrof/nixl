@@ -52,6 +52,8 @@
 #include <vector>
 
 #include "nixl.h"
+
+#include "cuda_dmabuf.h"
 #include "nixl_descriptors.h"
 #include "nixl_params.h"
 
@@ -75,9 +77,16 @@ struct Options {
     bool hugepage = false; // 2 MiB-aligned buffers advised MADV_HUGEPAGE
     std::string bufferMode = "host"; // host | fixed | dmabuf
     // dmabuf mode only: sysheap (/dev/dma_heap/system), heap:<name> for any
-    // other dma-buf heap (a CMA heap, say), udmabuf, or udmabuf-huge (a
-    // hugetlb memfd, so the exporter hands out 2 MiB folios).
+    // other dma-buf heap (a CMA heap, say), udmabuf, udmabuf-huge (a
+    // hugetlb memfd, so the exporter hands out 2 MiB folios), or cuda.
+    //
+    // Every source but cuda is host memory: the dma-buf describes ordinary
+    // CPU pages and the transfer is still host DRAM to storage. cuda is the
+    // GPU-direct arm -- the payload is a CUDA device allocation exported as
+    // a dma-buf, registered as VRAM_SEG, and the drive DMAs into and out of
+    // VRAM with no host copy on the data path.
     std::string dmabufSource = "sysheap";
+    int cudaDevice = 0; // --dmabuf-source cuda: which GPU to allocate on
     bool expectRefusal = false; // pass when the kernel or device refuses every command
     uint64_t generation = 0;
     uint64_t seed = 0x5eed;
@@ -181,6 +190,16 @@ public:
                 exit(1);
             }
         }
+        gpu_ = o_.bufferMode == "dmabuf" && o_.dmabufSource == "cuda";
+        if (gpu_) {
+            std::string err;
+            if (!cuda_dmabuf::init(o_.cudaDevice, err)) {
+                fprintf(stderr, "cuda dma-buf unavailable: %s\n", err.c_str());
+                exit(1);
+            }
+            gpuBufs_.resize(o_.objects);
+            staging_.resize(o_.objectSize);
+        }
         bufs_.resize(o_.objects);
         dmabufFds_.assign(o_.objects, -1);
         mapLen_.assign(o_.objects, 0);
@@ -191,10 +210,24 @@ public:
                 align = huge;
                 size = (size + huge - 1) / huge * huge;
             }
-            if (o_.bufferMode == "dmabuf") {
+            if (gpu_) {
+                // GPU-direct: the payload is device memory. There is no CPU
+                // mapping at all, so patterns are staged through a host
+                // buffer and copied with the CUDA driver; the I/O path only
+                // ever sees the exported dma-buf.
+                const size_t map = (size + 4095) / 4096 * 4096;
+                std::string err;
+                if (!cuda_dmabuf::alloc(map, o_.alignment, gpuBufs_[i], err)) {
+                    fprintf(stderr, "cuda dma-buf allocation failed: %s\n", err.c_str());
+                    exit(1);
+                }
+                dmabufFds_[i] = gpuBufs_[i].fd;
+                bufs_[i] = reinterpret_cast<uint8_t *>(gpuBufs_[i].ptr);
+                mapLen_[i] = map;
+            } else if (o_.bufferMode == "dmabuf") {
                 // The payload lives in a dma-buf; the harness maps it only
                 // to fill and verify patterns, the I/O path never sees the
-                // mapping. A GPU dma-buf plugs into the same registration.
+                // mapping.
                 const size_t map = (size + 4095) / 4096 * 4096;
                 dmabufFds_[i] = allocDmabuf(o_.dmabufSource, map);
                 if (dmabufFds_[i] < 0) {
@@ -220,9 +253,13 @@ public:
             }
             // Touch every page so the backing is decided before the first
             // I/O and a huge-page buffer is one physical extent.
-            memset(bufs_[i], 0, size);
+            if (gpu_) {
+                cuda_dmabuf::memsetDevice(gpuBufs_[i].ptr, 0, size);
+            } else {
+                memset(bufs_[i], 0, size);
+            }
         }
-        nixl_reg_dlist_t dram(DRAM_SEG);
+        nixl_reg_dlist_t dram(gpu_ ? VRAM_SEG : DRAM_SEG);
         for (uint32_t i = 0; i < o_.objects; i++) {
             const std::string meta =
                 o_.bufferMode == "dmabuf" ? "dmabuf:" + std::to_string(dmabufFds_[i]) : "";
@@ -231,7 +268,8 @@ public:
         }
         nixl_reg_dlist_t blk(remoteType_);
         blk.addDesc(nixlBlobDesc(o_.rangeOffset, posix_ ? 0 : o_.rangeLen, devId(), ""));
-        check(agent_.registerMem(dram, &extra_) == NIXL_SUCCESS, "registerMem(DRAM_SEG)");
+        check(agent_.registerMem(dram, &extra_) == NIXL_SUCCESS,
+              gpu_ ? "registerMem(VRAM_SEG)" : "registerMem(DRAM_SEG)");
         check(agent_.registerMem(blk, &extra_) == NIXL_SUCCESS,
               posix_ ? "registerMem(FILE_SEG fd)" : "registerMem(BLK_SEG range)");
         dram_ = dram;
@@ -242,7 +280,13 @@ public:
         agent_.deregisterMem(dram_, &extra_);
         agent_.deregisterMem(blk_, &extra_);
         for (uint32_t i = 0; i < bufs_.size(); i++) {
-            if (dmabufFds_[i] >= 0) {
+            if (gpu_) {
+                // The fd belongs to the exported device allocation.
+                if (dmabufFds_[i] >= 0) {
+                    close(dmabufFds_[i]);
+                }
+                cuda_dmabuf::free(gpuBufs_[i]);
+            } else if (dmabufFds_[i] >= 0) {
                 munmap(bufs_[i], mapLen_[i]);
                 close(dmabufFds_[i]);
             } else {
@@ -269,6 +313,10 @@ public:
         }
         if (source.rfind("heap:", 0) == 0) {
             return heapAlloc(source.substr(5), len);
+        }
+        if (source == "cuda") {
+            fprintf(stderr, "cuda dma-bufs are allocated on the device, not here\n");
+            return -1;
         }
         fprintf(stderr, "unknown --dmabuf-source '%s'\n", source.c_str());
         return -1;
@@ -374,14 +422,15 @@ public:
     // generation. Returns the request status; writes trace lines.
     nixl_status_t
     transfer(nixl_xfer_op_t op, uint32_t first, uint32_t count, uint64_t gen, const char *tag) {
-        nixl_xfer_dlist_t local(DRAM_SEG);
+        nixl_xfer_dlist_t local(gpu_ ? VRAM_SEG : DRAM_SEG);
         nixl_xfer_dlist_t remote(remoteType_);
         for (uint32_t i = first; i < first + count; i++) {
             if (op == NIXL_WRITE) {
-                fillPattern(bufs_[i], o_.objectSize, o_, i, gen);
+                fillPattern(scratch(i), o_.objectSize, o_, i, gen);
             } else {
-                poison(bufs_[i], o_.objectSize);
+                poison(scratch(i), o_.objectSize);
             }
+            commitScratch(i);
             local.addDesc(nixlBasicDesc(reinterpret_cast<uintptr_t>(bufs_[i]), o_.objectSize, 0));
             remote.addDesc(nixlBasicDesc(objectOffset(i), o_.objectSize, devId()));
         }
@@ -450,7 +499,7 @@ public:
     bool
     verify(uint32_t first, uint32_t count, uint64_t gen, const char *tag) {
         for (uint32_t i = first; i < first + count; i++) {
-            const size_t bad = firstMismatch(bufs_[i], o_.objectSize, o_, i, gen);
+            const size_t bad = firstMismatch(readBack(i), o_.objectSize, o_, i, gen);
             if (bad != o_.objectSize) {
                 printf("  FAIL: %s: object %u gen %llu first mismatch at byte %zu\n",
                        tag,
@@ -467,6 +516,34 @@ public:
     uint64_t lastElapsedNs_ = 0;
 
 private:
+    // On the GPU arm the payload has no CPU mapping, so patterns are built
+    // in a host staging buffer and copied across; everywhere else these
+    // resolve to the payload itself and cost nothing.
+    uint8_t *
+    scratch(uint32_t i) {
+        return gpu_ ? staging_.data() : bufs_[i];
+    }
+
+    void
+    commitScratch(uint32_t i) {
+        if (gpu_ && !cuda_dmabuf::toDevice(gpuBufs_[i].ptr, staging_.data(), o_.objectSize)) {
+            fprintf(stderr, "cuMemcpyHtoD failed for object %u\n", i);
+            exit(1);
+        }
+    }
+
+    const uint8_t *
+    readBack(uint32_t i) {
+        if (!gpu_) {
+            return bufs_[i];
+        }
+        if (!cuda_dmabuf::fromDevice(staging_.data(), gpuBufs_[i].ptr, o_.objectSize)) {
+            fprintf(stderr, "cuMemcpyDtoH failed for object %u\n", i);
+            exit(1);
+        }
+        return staging_.data();
+    }
+
     const Options &o_;
     nixlAgent &agent_;
     nixl_opt_args_t extra_;
@@ -478,6 +555,9 @@ private:
     std::vector<uint8_t *> bufs_;
     std::vector<int> dmabufFds_;
     std::vector<size_t> mapLen_;
+    bool gpu_ = false;
+    std::vector<cuda_dmabuf::Buf> gpuBufs_;
+    std::vector<uint8_t> staging_;
     Device dev_;
     uint32_t requestId_ = 0;
 };
@@ -651,7 +731,8 @@ usage(const char *prog) {
             "  [--range-offset BYTES] [--range-len BYTES] [--objects N] [--object-size BYTES]\n"
             "  [--batch N] [--num-tasks N] [--max-io-bytes BYTES] [--max-io-bytes-force BYTES]\n"
             "  [--hugepage] [--buffer-mode host|fixed|dmabuf]\n"
-            "  [--dmabuf-source sysheap|heap:<name>|udmabuf|udmabuf-huge]\n"
+            "  [--dmabuf-source sysheap|heap:<name>|udmabuf|udmabuf-huge|cuda]\n"
+            "  [--cuda-device N]   GPU ordinal for --dmabuf-source cuda\n"
             "  [--expect-refusal] [--generation N] [--seed N]\n"
             "  [--expect-serial S] [--expect-wwid W] [--trace-out FILE]\n",
             prog);
@@ -681,6 +762,7 @@ main(int argc, char **argv) {
         {"hugepage", no_argument, nullptr, 'H'},
         {"buffer-mode", required_argument, nullptr, 'M'},
         {"dmabuf-source", required_argument, nullptr, 'D'},
+        {"cuda-device", required_argument, nullptr, 'G'},
         {"expect-refusal", no_argument, nullptr, 'R'},
         {"generation", required_argument, nullptr, 'g'},
         {"seed", required_argument, nullptr, 'S'},
@@ -692,7 +774,7 @@ main(int argc, char **argv) {
     };
     int c;
     while ((c = getopt_long(
-                argc, argv, "B:d:a:o:l:n:s:b:q:m:F:HM:D:Rg:S:E:W:t:h", longopts, nullptr)) != -1) {
+                argc, argv, "B:d:a:o:l:n:s:b:q:m:F:HM:D:G:Rg:S:E:W:t:h", longopts, nullptr)) != -1) {
         switch (c) {
         case 'B':
             o.backend = optarg;
@@ -735,6 +817,9 @@ main(int argc, char **argv) {
             break;
         case 'D':
             o.dmabufSource = optarg;
+            break;
+        case 'G':
+            o.cudaDevice = atoi(optarg);
             break;
         case 'R':
             o.expectRefusal = true;
