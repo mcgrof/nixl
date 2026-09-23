@@ -67,8 +67,8 @@ never a partial success. Counters (`descs_requested`, `cmds_submitted`,
 
 | `async` | Handle | Kernel path |
 | --- | --- | --- |
-| `io_uring_cmd` (default) | `/dev/ngXnY` | NVMe passthrough over `IORING_OP_URING_CMD`; commands above `max_hw_sectors_kb` are rejected by the kernel, not split |
-| `io_uring` | `/dev/nvmeXnY` or a file | `IORING_OP_READV/WRITEV` with `O_DIRECT` (`direct=true`); the block layer splits at `max_sectors_kb` |
+| `io_uring_cmd` | `/dev/ngXnY` | NVMe passthrough over `IORING_OP_URING_CMD`; commands above `max_hw_sectors_kb` are rejected by the kernel, not split |
+| `io_uring` (default) | `/dev/nvmeXnY` or a file | `IORING_OP_READV/WRITEV` with `O_DIRECT` (`direct=true`); the block layer splits at `max_sectors_kb` |
 | `libaio` | block device or file | Linux AIO, reference only |
 | `posix`, `thrpool` | anything | emulated by xNVMe, development only |
 
@@ -118,7 +118,7 @@ sizes with any dma-buf number.
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `device_name` | (required) | xNVMe URI of the namespace, block device or file |
-| `async` | `io_uring_cmd` | asynchronous command interface, see above |
+| `async` | `io_uring` | asynchronous command interface, see above |
 | `direct` | `true` | `O_DIRECT` for the block and file paths |
 | `nsid` | `0` (unset) | expected namespace id, validated against the opened handle |
 | `num_tasks` | `128` | queue capacity; power of two in [1, 2048] |

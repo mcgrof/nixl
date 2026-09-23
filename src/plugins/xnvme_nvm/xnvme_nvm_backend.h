@@ -232,7 +232,7 @@ private:
     initDevice();
 
     static constexpr uint32_t kDefaultNumTasks = 128;
-    static constexpr const char *kDefaultAsync = "io_uring_cmd";
+    static constexpr const char *kDefaultAsync = "io_uring";
 
     std::unique_ptr<nixlXnvmeNvmDevIface> dev_;
     std::unique_ptr<nixlXnvmeNvmProgressEngine> engine_;

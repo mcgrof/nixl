@@ -62,7 +62,7 @@ namespace {
 struct Options {
     std::string backend = "XNVME_NVM"; // or POSIX: the upstream file reference
     std::string device;
-    std::string async = "io_uring_cmd";
+    std::string async = "io_uring";
     std::string expectSerial;
     std::string expectWwid;
     std::string traceOut;

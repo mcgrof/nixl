@@ -222,6 +222,18 @@ private:
 // this regressed nothing failed loudly: the lookup simply missed and the
 // device kept default geometry, silently losing MDTS, the dma-buf ceiling,
 // and the serial used to confirm which drive had been opened.
+// Registered buffers, and so every dma-buf, ride READ_FIXED/WRITE_FIXED on
+// the block node, which only the io_uring transport offers.  A default of
+// io_uring_cmd would mean a caller who asks for a dma-buf without naming a
+// transport is refused, and would silently cap any other transfer at the
+// device's maximum since a passthrough command is never split.
+TEST(XnvmeNvmParams, DefaultTransportIsIoUring) {
+    EngineMaker maker({{"device_name", "/dev/mock0"}});
+    auto engine = maker.make();
+    ASSERT_NE(engine, nullptr);
+    EXPECT_EQ(maker.mock->openedOpts.async, "io_uring");
+}
+
 TEST(XnvmeNvmSysfsNames, KernelNamesParse) {
     std::string ctrl, ns;
     ASSERT_TRUE(nixl_xnvme_nvm::sysfsNamesFor("/dev/nvme1n1", ctrl, ns));
