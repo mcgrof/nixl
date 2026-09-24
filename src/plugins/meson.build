@@ -33,6 +33,12 @@ if enabled_plugins.get('XNVME_NVM')
     endif
 endif
 
+# Deliberately not gated on the xNVMe dependency: this backend exists to be
+# buildable without it.
+if enabled_plugins.get('IO_URING')
+    subdir('io_uring')
+endif
+
 if enabled_plugins.get('OBJ')
     subdir('obj')
 endif
