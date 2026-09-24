@@ -248,10 +248,22 @@ TEST(XnvmeNvmSysfsNames, KernelNamesParse) {
 TEST(XnvmeNvmSysfsNames, NonDevicesAreRejected) {
     std::string ctrl, ns;
     EXPECT_FALSE(nixl_xnvme_nvm::sysfsNamesFor("/var/tmp/backing.bin", ctrl, ns));
-    // A partition is not a namespace handle; its queue limits live on the
-    // parent, so refuse it rather than read the wrong directory.
-    EXPECT_FALSE(nixl_xnvme_nvm::sysfsNamesFor("/dev/nvme0n1p2", ctrl, ns));
     EXPECT_FALSE(nixl_xnvme_nvm::sysfsNamesFor("/dev/sda", ctrl, ns));
+}
+
+// A partition has no queue limits or identity of its own: they belong to the
+// namespace it was cut from, and that is what bounds a request issued through
+// it. Refusing the name would leave a partitioned device with no MDTS and no
+// dma-buf ceiling.
+TEST(XnvmeNvmSysfsNames, PartitionsMapToTheirNamespace) {
+    std::string ctrl, ns;
+    ASSERT_TRUE(nixl_xnvme_nvm::sysfsNamesFor("/dev/nvme0n1p2", ctrl, ns));
+    EXPECT_EQ(ctrl, "nvme0");
+    EXPECT_EQ(ns, "nvme0n1");
+
+    ASSERT_TRUE(nixl_xnvme_nvm::sysfsNamesFor("/dev/nvme3n2p11", ctrl, ns));
+    EXPECT_EQ(ctrl, "nvme3");
+    EXPECT_EQ(ns, "nvme3n2");
 }
 
 TEST(XnvmeNvmSysfsNames, StableAliasesResolveToTheKernelName) {

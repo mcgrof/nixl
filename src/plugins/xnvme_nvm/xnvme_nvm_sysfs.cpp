@@ -75,10 +75,18 @@ sysfsNamesFor(const std::string &uri, std::string &ctrl, std::string &ns) {
     }
     const size_t slash = path.find_last_of('/');
     const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
-    unsigned c = 0, n = 0;
+    unsigned c = 0, n = 0, part = 0;
     char tail = 0;
     if (sscanf(base.c_str(), "ng%un%u%c", &c, &n, &tail) == 2 ||
-        sscanf(base.c_str(), "nvme%un%u%c", &c, &n, &tail) == 2) {
+        sscanf(base.c_str(), "nvme%un%u%c", &c, &n, &tail) == 2 ||
+        /*
+         * A partition carries no queue limits and no identity of its own:
+         * both live on the namespace it was cut from, and that is what
+         * bounds a request made through the partition.  Map nvmeXnYpZ onto
+         * nvmeXnY rather than refusing it, or every partitioned device
+         * silently loses MDTS and the dma-buf ceiling.
+         */
+        sscanf(base.c_str(), "nvme%un%up%u%c", &c, &n, &part, &tail) == 3) {
         ctrl = "nvme" + std::to_string(c);
         ns = ctrl + "n" + std::to_string(n);
         return true;
