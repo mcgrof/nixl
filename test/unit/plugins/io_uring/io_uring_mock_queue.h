@@ -21,6 +21,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -37,6 +38,7 @@ public:
     uint32_t logicalBlockBytes = 512;
     uint64_t sizeBytes = 64 * 1024 * 1024;
     uint32_t maxHwBytes = 0;
+    uint32_t maxHwDmabufBytes = 0;
     uint32_t memAlignBytes = 512;
     uint32_t offsetAlignBytes = 512;
     std::string serial = "MOCK0";
@@ -44,7 +46,8 @@ public:
     nixl_status_t openResult = NIXL_SUCCESS;
 
     // --- registration knobs ---
-    // Non-zero stands in for a kernel that refuses the registration.
+    // Non-zero stands in for a kernel that refuses the registration, which is
+    // how one without the dma-buf interface answers.
     int registerErr = 0;
     uint32_t maxSlots = 8;
 
@@ -63,8 +66,11 @@ public:
     std::vector<uint8_t> store;
     std::vector<std::pair<uint64_t, uint32_t>> submitted; // (offset, bytes) in order
     std::vector<uint32_t> submittedSlots; // slot per submitted request
-    // Registered buffers: slot -> (base, len).
+    // Registered buffers: slot -> (base, len). A dma-buf slot's base is the
+    // memory the test declared for that fd in dmabufBacking.
     std::map<uint32_t, std::pair<uint8_t *, size_t>> slots;
+    std::map<int, uint8_t *> dmabufBacking;
+    std::set<uint32_t> dmabufSlots; // slots addressed by offset, not pointer
     int registerCalls = 0;
     int unregisterCalls = 0;
     int submitAttempts = 0;
@@ -85,6 +91,7 @@ public:
         target_.sizeBytes = sizeBytes;
         target_.logicalBlockBytes = logicalBlockBytes;
         target_.maxHwBytes = maxHwBytes;
+        target_.maxHwDmabufBytes = maxHwDmabufBytes;
         target_.memAlignBytes = memAlignBytes;
         target_.offsetAlignBytes = offsetAlignBytes;
         target_.serial = serial;
@@ -116,8 +123,25 @@ public:
     }
 
     int
+    registerDmabuf(int fd, size_t len, uint32_t &slot) override {
+        if (registerErr) {
+            return registerErr;
+        }
+        auto it = dmabufBacking.find(fd);
+        if (it == dmabufBacking.end()) {
+            return -EBADF;
+        }
+        int rc = addSlot(it->second, len, slot);
+        if (rc == 0) {
+            dmabufSlots.insert(slot);
+        }
+        return rc;
+    }
+
+    int
     unregisterBuffer(uint32_t slot) override {
         unregisterCalls++;
+        dmabufSlots.erase(slot);
         return slots.erase(slot) ? 0 : -ENOENT;
     }
 
@@ -190,8 +214,8 @@ private:
         return -ENOSPC;
     }
 
-    // Where a request's bytes live: a plain pointer, or a pointer inside a
-    // registered host range.
+    // Where a request's bytes live: a plain pointer, a pointer inside a
+    // registered host range, or an offset inside a registered dma-buf.
     uint8_t *
     resolve(const pending &cmd, bool &ok) {
         ok = true;
@@ -205,9 +229,16 @@ private:
         }
         const auto [base, len] = it->second;
         const auto raw = reinterpret_cast<uintptr_t>(cmd.buf);
-        // A host slot must carry an address inside its registered range.
-        // Anything else is a backend bug, and fails the request rather than
-        // reading stray memory.
+        // A dma-buf slot must carry a byte offset into the buffer, and a host
+        // slot an address inside its registered range. Anything else is a
+        // backend bug, and fails the request rather than reading stray memory.
+        if (dmabufSlots.count(cmd.slot)) {
+            if (raw >= len) {
+                ok = false;
+                return nullptr;
+            }
+            return base + raw;
+        }
         const auto lo = reinterpret_cast<uintptr_t>(base);
         if (raw < lo || raw >= lo + len) {
             ok = false;

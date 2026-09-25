@@ -25,19 +25,21 @@
 
 namespace {
 
-// A registered payload buffer in fixed mode: the slot the ring handed out,
-// and the virtual range the caller addresses it by.
+// A registered payload buffer in fixed or dmabuf mode: the slot the ring
+// handed out, and the virtual range the caller addresses it by.
 class nixlIoUringBufferMetadata : public nixlBackendMD {
 public:
-    nixlIoUringBufferMetadata(uint32_t slot, uintptr_t base, size_t len)
+    nixlIoUringBufferMetadata(uint32_t slot, uintptr_t base, size_t len, bool is_dmabuf)
         : nixlBackendMD(true),
           slot(slot),
           base(base),
-          len(len) {}
+          len(len),
+          isDmabuf(is_dmabuf) {}
 
     uint32_t slot;
     uintptr_t base;
     size_t len;
+    bool isDmabuf;
 };
 
 // A BLK_SEG registration: the byte range of the target a devId may address.
@@ -55,6 +57,27 @@ public:
     uint64_t offset;
     size_t len;
 };
+
+// Reads "dmabuf:<fd>" out of a registration's metaInfo.
+bool
+parseDmabufMeta(const std::string &meta, int &fd) {
+    static const std::string prefix = "dmabuf:";
+    if (meta.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    try {
+        size_t pos = 0;
+        const long parsed = std::stol(meta.substr(prefix.size()), &pos, 10);
+        if (pos != meta.size() - prefix.size() || parsed < 0 || parsed > INT32_MAX) {
+            return false;
+        }
+        fd = static_cast<int>(parsed);
+        return true;
+    }
+    catch (const std::exception &) {
+        return false;
+    }
+}
 
 bool
 parseUnsigned(const std::string &text, unsigned long long max, unsigned long long &out) {
@@ -87,7 +110,14 @@ parseBool(const std::string &text, bool &out) {
 
 const char *
 bufferModeName(nixlIoUringBufferMode mode) {
-    return mode == nixlIoUringBufferMode::fixed ? "fixed" : "host";
+    switch (mode) {
+    case nixlIoUringBufferMode::fixed:
+        return "fixed";
+    case nixlIoUringBufferMode::dmabuf:
+        return "dmabuf";
+    default:
+        return "host";
+    }
 }
 
 } // namespace
@@ -99,7 +129,9 @@ nixlIoUringEngine::lengthAlignment(const nixlIoUringTarget &t) {
 }
 
 uint32_t
-nixlIoUringEngine::computeMaxIoBytes(const nixlIoUringTarget &target, uint32_t user_max_io_bytes) {
+nixlIoUringEngine::computeMaxIoBytes(const nixlIoUringTarget &target,
+                                     nixlIoUringBufferMode mode,
+                                     uint32_t user_max_io_bytes) {
     // A single read or write carries its length in an unsigned, so no request
     // can exceed that however permissive the target is.
     uint64_t limit = UINT32_MAX;
@@ -113,7 +145,15 @@ nixlIoUringEngine::computeMaxIoBytes(const nixlIoUringTarget &target, uint32_t u
             limit = candidate;
         }
     };
-    fold(target.maxHwBytes);
+    // A dma-buf payload is described to the driver by DMA addresses rather
+    // than pages, so the descriptor budget a request fits into differs and the
+    // queue advertises its own ceiling for it. Where the kernel publishes
+    // none, such a request is bounded like any other.
+    if (mode == nixlIoUringBufferMode::dmabuf && target.maxHwDmabufBytes) {
+        fold(target.maxHwDmabufBytes);
+    } else {
+        fold(target.maxHwBytes);
+    }
     // queue/max_segments is deliberately left out. These are ordinary reads
     // and writes, which the block layer splits when a buffer needs more
     // segments than the queue allows; only a request the driver had to map
@@ -171,8 +211,9 @@ nixlIoUringEngine::nixlIoUringEngine(const nixlBackendInitParams *init_params,
               << "' wwid='" << t.wwid << "' logical_block_bytes=" << t.logicalBlockBytes
               << " mem_align_bytes=" << t.memAlignBytes
               << " offset_align_bytes=" << t.offsetAlignBytes << " size_bytes=" << t.sizeBytes
-              << " max_hw_bytes=" << t.maxHwBytes << " max_io_bytes=" << maxIoBytes_
-              << " num_tasks=" << numTasks_ << " buffer_mode=" << bufferModeName(bufferMode_);
+              << " max_hw_bytes=" << t.maxHwBytes << " max_hw_dmabuf_bytes=" << t.maxHwDmabufBytes
+              << " max_io_bytes=" << maxIoBytes_ << " num_tasks=" << numTasks_
+              << " buffer_mode=" << bufferModeName(bufferMode_);
 }
 
 nixlIoUringEngine::~nixlIoUringEngine() {
@@ -229,6 +270,14 @@ nixlIoUringEngine::parseInitParams(const nixl_b_params_t *custom_params) {
         forceMaxIoBytes_ = static_cast<uint32_t>(value);
     }
 
+    if (auto it = custom_params->find("max_dmabuf_bytes"); it != custom_params->end()) {
+        if (!parseUnsigned(it->second, UINT64_MAX, value) || value == 0) {
+            NIXL_ERROR << "IO_URING: invalid max_dmabuf_bytes '" << it->second << "'";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        maxDmabufBytes_ = value;
+    }
+
     if (auto it = custom_params->find("expect_serial"); it != custom_params->end()) {
         expectSerial_ = it->second;
     }
@@ -241,8 +290,11 @@ nixlIoUringEngine::parseInitParams(const nixl_b_params_t *custom_params) {
             bufferMode_ = nixlIoUringBufferMode::host;
         } else if (it->second == "fixed") {
             bufferMode_ = nixlIoUringBufferMode::fixed;
+        } else if (it->second == "dmabuf") {
+            bufferMode_ = nixlIoUringBufferMode::dmabuf;
         } else {
-            NIXL_ERROR << "IO_URING: buffer_mode must be host or fixed; got '" << it->second << "'";
+            NIXL_ERROR << "IO_URING: buffer_mode must be host, fixed or dmabuf; got '" << it->second
+                       << "'";
             return NIXL_ERR_INVALID_PARAM;
         }
     }
@@ -291,9 +343,10 @@ nixlIoUringEngine::initQueue() {
                      "identity unvalidated";
     }
 
-    maxIoBytes_ = computeMaxIoBytes(t, userMaxIoBytes_);
+    maxIoBytes_ = computeMaxIoBytes(t, bufferMode_, userMaxIoBytes_);
     if (maxIoBytes_ == 0) {
-        NIXL_ERROR << "IO_URING: max_io_bytes is smaller than the target's direct-I/O alignment";
+        NIXL_ERROR << "IO_URING: max_io_bytes is smaller than the target's "
+                      "direct-I/O alignment";
         queue_->close();
         return NIXL_ERR_INVALID_PARAM;
     }
@@ -336,7 +389,8 @@ nixlIoUringEngine::registerMem(const nixlBlobDesc &mem,
                                nixlBackendMD *&out) {
     out = nullptr;
 
-    if (nixl_mem == DRAM_SEG) {
+    const bool vram_dmabuf = nixl_mem == VRAM_SEG && bufferMode_ == nixlIoUringBufferMode::dmabuf;
+    if (nixl_mem == DRAM_SEG || vram_dmabuf) {
         if (bufferMode_ == nixlIoUringBufferMode::host) {
             // A host buffer reaches the kernel as a pointer on every request;
             // there is nothing to pin or map here.
@@ -355,14 +409,32 @@ nixlIoUringEngine::registerMem(const nixlBlobDesc &mem,
             return NIXL_ERR_INVALID_PARAM;
         }
         uint32_t slot = IO_URING_NO_SLOT;
-        const int err =
-            queue_->registerHostBuffer(reinterpret_cast<void *>(mem.addr), mem.len, slot);
+        int err;
+        bool is_dmabuf = false;
+        if (bufferMode_ == nixlIoUringBufferMode::dmabuf) {
+            int fd = -1;
+            if (!parseDmabufMeta(mem.metaInfo, fd)) {
+                NIXL_ERROR << "IO_URING: buffer_mode=dmabuf needs metaInfo 'dmabuf:<fd>' on "
+                              "every registration";
+                return NIXL_ERR_INVALID_PARAM;
+            }
+            if (mem.len > maxDmabufBytes_) {
+                NIXL_ERROR << "IO_URING: dma-buf of " << mem.len
+                           << " bytes exceeds max_dmabuf_bytes " << maxDmabufBytes_
+                           << "; register it as several dma-bufs";
+                return NIXL_ERR_INVALID_PARAM;
+            }
+            err = queue_->registerDmabuf(fd, mem.len, slot);
+            is_dmabuf = true;
+        } else {
+            err = queue_->registerHostBuffer(reinterpret_cast<void *>(mem.addr), mem.len, slot);
+        }
         if (err) {
-            NIXL_ERROR << "IO_URING: buffer registration (" << mem.len
-                       << " bytes) failed: " << strerror(-err);
+            NIXL_ERROR << "IO_URING: buffer registration (" << (is_dmabuf ? "dmabuf" : "fixed")
+                       << ", " << mem.len << " bytes) failed: " << strerror(-err);
             return NIXL_ERR_BACKEND;
         }
-        out = new nixlIoUringBufferMetadata(slot, mem.addr, mem.len);
+        out = new nixlIoUringBufferMetadata(slot, mem.addr, mem.len, is_dmabuf);
         return NIXL_SUCCESS;
     }
     if (nixl_mem != BLK_SEG) {
@@ -413,9 +485,9 @@ nixlIoUringEngine::deregisterMem(nixlBackendMD *meta) {
         return NIXL_SUCCESS;
     }
     if (auto *buffer = dynamic_cast<nixlIoUringBufferMetadata *>(meta)) {
-        // The kernel keeps a registered buffer pinned until its slot is
-        // cleared; requests still referencing it were drained when their own
-        // request handles were released.
+        // The kernel keeps a registered buffer pinned or mapped until its slot
+        // is cleared; requests still referencing it were drained when their
+        // own request handles were released.
         const uint32_t slot = buffer->slot;
         const int err = queue_->unregisterBuffer(slot);
         delete buffer;
@@ -483,8 +555,12 @@ nixlIoUringEngine::prepXfer(const nixl_xfer_op_t &operation,
         NIXL_WARN << "IO_URING: remote agent (" << remote_agent << ") != local agent ("
                   << localAgent << "); IO_URING is a local storage backend";
     }
-    if (local.getType() != DRAM_SEG) {
-        NIXL_ERROR << "IO_URING: local descriptor list must be DRAM_SEG, got " << local.getType();
+    const bool local_ok = local.getType() == DRAM_SEG ||
+        (local.getType() == VRAM_SEG && bufferMode_ == nixlIoUringBufferMode::dmabuf);
+    if (!local_ok) {
+        NIXL_ERROR << "IO_URING: local descriptor list must be DRAM_SEG (or VRAM_SEG in "
+                      "buffer_mode=dmabuf), got "
+                   << local.getType();
         return NIXL_ERR_INVALID_PARAM;
     }
     if (remote.getType() != BLK_SEG) {
@@ -584,7 +660,14 @@ nixlIoUringEngine::prepXfer(const nixl_xfer_op_t &operation,
             task.offset = r.addr + done;
             task.buf = reinterpret_cast<void *>(l.addr + done);
             if (bufferMode_ != nixlIoUringBufferMode::host) {
-                task.slot = static_cast<const nixlIoUringBufferMetadata *>(l.metadataP)->slot;
+                const auto *bmd = static_cast<const nixlIoUringBufferMetadata *>(l.metadataP);
+                task.slot = bmd->slot;
+                if (bmd->isDmabuf) {
+                    // A dma-buf has no address the caller can pass: the kernel
+                    // knows the mapping, and the request names a byte offset
+                    // into it.
+                    task.buf = reinterpret_cast<void *>(l.addr - bmd->base + done);
+                }
             }
             req_h->tasks_.push_back(task);
         }

@@ -305,10 +305,27 @@ TEST(IoUringCeiling, SmallestNonZeroSourceWins) {
     nixlIoUringTarget t;
     t.logicalBlockBytes = 512;
     t.maxHwBytes = 128u << 10;
-    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, 0), 128u << 10);
-    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, 64u << 10), 64u << 10);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::host, 0), 128u << 10);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::host, 64u << 10),
+              64u << 10);
     t.maxHwBytes = 2u << 20;
-    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, 0), 2u << 20);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::host, 0), 2u << 20);
+}
+
+// A dma-buf payload is bounded by its own advertised ceiling where the kernel
+// publishes one, and by the ordinary one where it does not.
+TEST(IoUringCeiling, DmabufUsesItsOwnHardwareCeiling) {
+    nixlIoUringTarget t;
+    t.logicalBlockBytes = 512;
+    t.maxHwBytes = 128u << 10;
+    t.maxHwDmabufBytes = 2u << 20;
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::dmabuf, 0), 2u << 20);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::host, 0), 128u << 10);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::fixed, 0), 128u << 10);
+    // Without the knob a dma-buf request is bounded like any other.
+    t.maxHwDmabufBytes = 0;
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::dmabuf, 0),
+              128u << 10);
 }
 
 // A target may demand a wider alignment of the payload address than of the
@@ -320,13 +337,13 @@ TEST(IoUringCeiling, LengthFollowsTheOffsetAlignmentNotTheAddress) {
     t.memAlignBytes = 4096;
     t.offsetAlignBytes = 512;
     EXPECT_EQ(nixlIoUringEngine::lengthAlignment(t), 512u);
-    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, 1536), 1536u);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::host, 1536), 1536u);
 }
 
 TEST(IoUringCeiling, FallbackAppliesWhenNoSourceNamesALimit) {
     nixlIoUringTarget t;
     t.logicalBlockBytes = 512;
-    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, 0), 1u << 20);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::host, 0), 1u << 20);
 }
 
 TEST(IoUringCeiling, RoundsDownToTheDirectIoAlignment) {
@@ -334,9 +351,9 @@ TEST(IoUringCeiling, RoundsDownToTheDirectIoAlignment) {
     t.logicalBlockBytes = 4096;
     t.memAlignBytes = 4096;
     t.offsetAlignBytes = 4096;
-    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, 5000), 4096u);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::host, 5000), 4096u);
     // A ceiling below one whole aligned unit can produce no legal request.
-    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, 100), 0u);
+    EXPECT_EQ(nixlIoUringEngine::computeMaxIoBytes(t, nixlIoUringBufferMode::host, 100), 0u);
 }
 
 // --- parameters -----------------------------------------------------------
@@ -352,6 +369,8 @@ TEST(IoUringParams, InvalidValuesThrow) {
     EXPECT_THROW(EngineMaker({{"device_name", "/dev/mock0"}, {"direct", "yes"}}).make(),
                  std::runtime_error);
     EXPECT_THROW(EngineMaker({{"device_name", "/dev/mock0"}, {"buffer_mode", "pool"}}).make(),
+                 std::runtime_error);
+    EXPECT_THROW(EngineMaker({{"device_name", "/dev/mock0"}, {"max_dmabuf_bytes", "0"}}).make(),
                  std::runtime_error);
 }
 
@@ -413,14 +432,36 @@ TEST(IoUringParams, CeilingCannotUndercutDirectIoAlignment) {
 // that has to surface here rather than as a mysterious transfer failure.
 TEST(IoUringRegistered, RegistrationRefusedByTheKernelIsReported) {
     AlignedBuf buf(8192);
-    EngineMaker maker({{"device_name", "/dev/mock0"}, {"buffer_mode", "fixed"}});
-    maker.configureMock = [](nixlIoUringMockQueue &m) { m.registerErr = -EINVAL; };
+    for (const char *mode : {"fixed", "dmabuf"}) {
+        EngineMaker maker({{"device_name", "/dev/mock0"}, {"buffer_mode", mode}});
+        maker.configureMock = [&buf](nixlIoUringMockQueue &m) {
+            m.registerErr = -EINVAL;
+            m.dmabufBacking[9] = buf.data;
+        };
+        auto engine = maker.make();
+        nixlBackendMD *md = nullptr;
+        EXPECT_EQ(engine->registerMem(
+                      nixlBlobDesc(reinterpret_cast<uintptr_t>(buf.data), 8192, 0, "dmabuf:9"),
+                      DRAM_SEG,
+                      md),
+                  NIXL_ERR_BACKEND)
+            << "buffer_mode=" << mode;
+        EXPECT_EQ(md, nullptr);
+    }
+}
+
+// A dma-buf the caller names by an fd the kernel does not know fails at
+// registration with the kernel's own errno.
+TEST(IoUringRegistered, DmabufWithAnUnknownFdIsRefused) {
+    EngineMaker maker({{"device_name", "/dev/mock0"}, {"buffer_mode", "dmabuf"}});
     auto engine = maker.make();
+    AlignedBuf buf(8192);
     nixlBackendMD *md = nullptr;
     EXPECT_EQ(engine->registerMem(
-                  nixlBlobDesc(reinterpret_cast<uintptr_t>(buf.data), 8192, 0, ""), DRAM_SEG, md),
+                  nixlBlobDesc(reinterpret_cast<uintptr_t>(buf.data), 8192, 0, "dmabuf:99"),
+                  DRAM_SEG,
+                  md),
               NIXL_ERR_BACKEND);
-    EXPECT_EQ(md, nullptr);
 }
 
 TEST(IoUringRegistered, FixedRegistersAndTransfersWithSlots) {
@@ -474,6 +515,138 @@ TEST(IoUringRegistered, FixedRegistersAndTransfersWithSlots) {
 
     engine->deregisterMem(hmd);
     EXPECT_EQ(maker.mock->unregisterCalls, 1);
+    engine->deregisterMem(bmd);
+}
+
+TEST(IoUringRegistered, DmabufUsesOffsetsAndItsOwnCeiling) {
+    EngineMaker maker({{"device_name", "/dev/mock0"}, {"buffer_mode", "dmabuf"}});
+    AlignedBuf backing(16384);
+    maker.configureMock = [&backing](nixlIoUringMockQueue &m) {
+        m.dmabufBacking[42] = backing.data;
+        m.maxHwBytes = 128u << 10; // what an ordinary request is bounded by
+        m.maxHwDmabufBytes = 2u << 20; // what a dma-buf request is bounded by
+    };
+    auto engine = maker.make();
+    EXPECT_EQ(engine->maxIoBytes(), 2u << 20);
+
+    // Registration names the dma-buf by fd. addr is whatever base the caller
+    // addresses the buffer by, and never reaches the kernel.
+    nixlBackendMD *hmd = nullptr;
+    EXPECT_EQ(
+        engine->registerMem(
+            nixlBlobDesc(reinterpret_cast<uintptr_t>(backing.data), 16384, 0, ""), DRAM_SEG, hmd),
+        NIXL_ERR_INVALID_PARAM); // no dmabuf:<fd>
+    ASSERT_EQ(engine->registerMem(
+                  nixlBlobDesc(reinterpret_cast<uintptr_t>(backing.data), 16384, 0, "dmabuf:42"),
+                  DRAM_SEG,
+                  hmd),
+              NIXL_SUCCESS);
+    nixlBackendMD *bmd = nullptr;
+    ASSERT_EQ(engine->registerMem(nixlBlobDesc(0, 0, 0, ""), BLK_SEG, bmd), NIXL_SUCCESS);
+
+    XferHarness::fill(backing, 9);
+    nixl_meta_dlist_t local(DRAM_SEG), remote(BLK_SEG);
+    nixlMetaDesc l(reinterpret_cast<uintptr_t>(backing.data) + 4096, 8192, 0);
+    l.metadataP = hmd;
+    local.addDesc(l);
+    nixlMetaDesc r(65536, 8192, 0);
+    r.metadataP = bmd;
+    remote.addDesc(r);
+    nixlBackendReqH *handle = nullptr;
+    ASSERT_EQ(engine->prepXfer(NIXL_WRITE, local, remote, kAgent, handle), NIXL_SUCCESS);
+    // The mock fails a dma-buf request carrying an address instead of a byte
+    // offset, so a byte-exact store is what proves the offset semantics.
+    nixl_status_t st = engine->postXfer(NIXL_WRITE, local, remote, kAgent, handle);
+    for (int i = 0; st == NIXL_IN_PROG && i < 1000; i++) {
+        st = engine->checkXfer(handle);
+    }
+    EXPECT_EQ(st, NIXL_SUCCESS);
+    engine->releaseReqH(handle);
+    ASSERT_EQ(maker.mock->submitted.size(), 1u);
+    EXPECT_EQ(maker.mock->submitted[0], std::make_pair(uint64_t{65536}, uint32_t{8192}));
+    EXPECT_EQ(memcmp(maker.mock->store.data() + 65536, backing.data + 4096, 8192), 0);
+    engine->deregisterMem(hmd);
+    engine->deregisterMem(bmd);
+}
+
+TEST(IoUringRegistered, DmabufLargerThanTheKernelLimitIsRefused) {
+    // The kernel refuses a dma-buf above 1 GiB with a bare EINVAL; refuse it
+    // here first, with the reason, and let the limit be a parameter.
+    AlignedBuf backing(16384);
+    auto make = [&backing](const std::string &limit) {
+        nixl_b_params_t p{{"device_name", "/dev/mock0"}, {"buffer_mode", "dmabuf"}};
+        if (!limit.empty()) {
+            p["max_dmabuf_bytes"] = limit;
+        }
+        EngineMaker maker(p);
+        maker.configureMock = [&backing](nixlIoUringMockQueue &m) {
+            m.dmabufBacking[42] = backing.data;
+        };
+        return maker.make();
+    };
+    const uintptr_t base = reinterpret_cast<uintptr_t>(backing.data);
+    nixlBackendMD *md = nullptr;
+    auto engine = make("");
+    EXPECT_EQ(engine->registerMem(
+                  nixlBlobDesc(base, (size_t(1) << 30) + 4096, 0, "dmabuf:42"), DRAM_SEG, md),
+              NIXL_ERR_INVALID_PARAM);
+    EXPECT_EQ(md, nullptr);
+    ASSERT_EQ(
+        engine->registerMem(nixlBlobDesc(base, size_t(1) << 30, 0, "dmabuf:42"), DRAM_SEG, md),
+        NIXL_SUCCESS);
+    engine->deregisterMem(md);
+
+    auto small = make("8192");
+    md = nullptr;
+    EXPECT_EQ(small->registerMem(nixlBlobDesc(base, 16384, 0, "dmabuf:42"), DRAM_SEG, md),
+              NIXL_ERR_INVALID_PARAM);
+    ASSERT_EQ(small->registerMem(nixlBlobDesc(base, 8192, 0, "dmabuf:42"), DRAM_SEG, md),
+              NIXL_SUCCESS);
+    small->deregisterMem(md);
+}
+
+TEST(IoUringRegistered, VramIsOnlyReachableAsADmabuf) {
+    EngineMaker host;
+    auto plain = host.make();
+    nixlBackendMD *md = nullptr;
+    EXPECT_EQ(plain->registerMem(nixlBlobDesc(0x1000, 4096, 0, "dmabuf:7"), VRAM_SEG, md),
+              NIXL_ERR_NOT_SUPPORTED);
+    const auto mems = plain->getSupportedMems();
+    EXPECT_EQ(std::count(mems.begin(), mems.end(), VRAM_SEG), 0);
+
+    EngineMaker maker({{"device_name", "/dev/mock0"}, {"buffer_mode", "dmabuf"}});
+    AlignedBuf backing(8192);
+    maker.configureMock = [&backing](nixlIoUringMockQueue &m) {
+        m.dmabufBacking[7] = backing.data;
+    };
+    auto engine = maker.make();
+    const auto dmems = engine->getSupportedMems();
+    EXPECT_EQ(std::count(dmems.begin(), dmems.end(), VRAM_SEG), 1);
+    // The device pointer is any base the caller chooses: only the fd reaches
+    // the kernel, and the request carries an offset into the buffer.
+    const uintptr_t gpu_base = 0x7f0000000000ull;
+    ASSERT_EQ(engine->registerMem(nixlBlobDesc(gpu_base, 8192, 0, "dmabuf:7"), VRAM_SEG, md),
+              NIXL_SUCCESS);
+    nixlBackendMD *bmd = nullptr;
+    ASSERT_EQ(engine->registerMem(nixlBlobDesc(0, 0, 0, ""), BLK_SEG, bmd), NIXL_SUCCESS);
+    XferHarness::fill(backing, 5);
+    nixl_meta_dlist_t local(VRAM_SEG), remote(BLK_SEG);
+    nixlMetaDesc l(gpu_base + 4096, 4096, 0);
+    l.metadataP = md;
+    local.addDesc(l);
+    nixlMetaDesc r(8192, 4096, 0);
+    r.metadataP = bmd;
+    remote.addDesc(r);
+    nixlBackendReqH *handle = nullptr;
+    ASSERT_EQ(engine->prepXfer(NIXL_WRITE, local, remote, kAgent, handle), NIXL_SUCCESS);
+    nixl_status_t st = engine->postXfer(NIXL_WRITE, local, remote, kAgent, handle);
+    for (int i = 0; st == NIXL_IN_PROG && i < 1000; i++) {
+        st = engine->checkXfer(handle);
+    }
+    EXPECT_EQ(st, NIXL_SUCCESS);
+    engine->releaseReqH(handle);
+    EXPECT_EQ(memcmp(maker.mock->store.data() + 8192, backing.data + 4096, 4096), 0);
+    engine->deregisterMem(md);
     engine->deregisterMem(bmd);
 }
 

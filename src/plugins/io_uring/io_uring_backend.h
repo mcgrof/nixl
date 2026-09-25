@@ -55,16 +55,16 @@ struct nixlIoUringTask {
     uint32_t childIndex = 0;
     uint32_t bytes = 0;
     uint64_t offset = 0;
-    // A plain pointer, or with a registered slot an address inside the
-    // registered host range.
+    // A plain pointer, or with a registered slot either an address inside a
+    // registered host range or a byte offset into a registered dma-buf.
     void *buf = nullptr;
     uint32_t slot = IO_URING_NO_SLOT;
 };
 
 // How a payload buffer reaches the kernel. host passes a pointer with every
-// request; fixed passes a slot in the ring's registered buffer table, which
-// the kernel pins once at registration.
-enum class nixlIoUringBufferMode { host, fixed };
+// request; fixed and dmabuf pass a slot in the ring's registered buffer
+// table, which the kernel pins or maps once at registration.
+enum class nixlIoUringBufferMode { host, fixed, dmabuf };
 
 class nixlIoUringBackendReqH : public nixlBackendReqH {
 public:
@@ -137,6 +137,11 @@ public:
 
     nixl_mem_list_t
     getSupportedMems() const override {
+        // Device memory is reachable only as a dma-buf, which is the one
+        // registration the kernel can map without pages behind it.
+        if (bufferMode_ == nixlIoUringBufferMode::dmabuf) {
+            return {BLK_SEG, DRAM_SEG, VRAM_SEG};
+        }
         return {BLK_SEG, DRAM_SEG};
     }
 
@@ -210,12 +215,15 @@ public:
     static uint32_t
     lengthAlignment(const nixlIoUringTarget &target);
 
-    // The request-size ceiling, exposed for tests: the smaller non-zero of
-    // the kernel's max_hw_sectors_kb and the caller's max_io_bytes, rounded
-    // down to the direct-I/O alignment. Where no source names a limit it
-    // falls back to kFallbackMaxIoBytes.
+    // The request-size ceiling, exposed for tests: the smallest non-zero of
+    // the kernel's max_hw_sectors_kb (max_hw_dmabuf_sectors_kb for a dma-buf
+    // payload) and the caller's max_io_bytes, rounded down to the direct-I/O
+    // alignment. Where no source names a limit it falls back to
+    // kFallbackMaxIoBytes.
     static uint32_t
-    computeMaxIoBytes(const nixlIoUringTarget &target, uint32_t user_max_io_bytes);
+    computeMaxIoBytes(const nixlIoUringTarget &target,
+                      nixlIoUringBufferMode mode,
+                      uint32_t user_max_io_bytes);
 
     nixlIoUringBufferMode
     bufferMode() const {
@@ -252,6 +260,9 @@ private:
     std::string expectSerial_;
     std::string expectWwid_;
     nixlIoUringBufferMode bufferMode_ = nixlIoUringBufferMode::host;
+    // Largest dma-buf the kernel will register; beyond it the registration
+    // fails with EINVAL, so refuse it here with something a caller can act on.
+    uint64_t maxDmabufBytes_ = uint64_t(1) << 30;
 
     // BLK_SEG devId -> the path it was bound to at registration, so one devId
     // cannot be re-registered against a different target.

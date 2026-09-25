@@ -100,6 +100,10 @@ readDiskLimits(const std::string &disk_dir, nixlIoUringTarget &target) {
     if (hw_kb && hw_kb < (1ul << 22)) {
         target.maxHwBytes = static_cast<uint32_t>(hw_kb) * 1024u;
     }
+    const unsigned long dmabuf_kb = readSysfsNumber(queue + "max_hw_dmabuf_sectors_kb");
+    if (dmabuf_kb && dmabuf_kb < (1ul << 22)) {
+        target.maxHwDmabufBytes = static_cast<uint32_t>(dmabuf_kb) * 1024u;
+    }
 
     // Identity lives partly on the disk and partly on the driver's device
     // below it: NVMe publishes the serial and firmware on the controller,

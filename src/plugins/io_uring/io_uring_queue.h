@@ -49,6 +49,11 @@ struct nixlIoUringTarget {
     // queue/max_hw_sectors_kb in bytes: the largest request the driver
     // accepts without the block layer splitting it.
     uint32_t maxHwBytes = 0;
+    // queue/max_hw_dmabuf_sectors_kb in bytes. A dma-buf payload carries no
+    // pages, so a driver that maps it describes it with a different
+    // descriptor budget and advertises its own ceiling; 0 means this kernel
+    // publishes no separate one.
+    uint32_t maxHwDmabufBytes = 0;
     // Direct-I/O alignment: what statx reports for a file, else the logical
     // block size.
     uint32_t memAlignBytes = 0;
@@ -87,12 +92,16 @@ public:
     virtual const nixlIoUringTarget &
     target() const = 0;
 
-    // Registered buffers. Registration hands back a slot index, and a
-    // request then names the slot and the virtual address inside the
-    // registered range. A kernel that cannot register the buffer says so
-    // here, at registration time, rather than failing the first transfer.
+    // Registered buffers. Registration hands back a slot index; a request
+    // then names the slot and addresses it either by a virtual address
+    // inside a registered host range or by a byte offset into a registered
+    // dma-buf. A kernel that cannot register the buffer says so here, at
+    // registration time, rather than failing the first transfer.
     virtual int
     registerHostBuffer(void *addr, size_t len, uint32_t &slot) = 0;
+
+    virtual int
+    registerDmabuf(int fd, size_t len, uint32_t &slot) = 0;
 
     virtual int
     unregisterBuffer(uint32_t slot) = 0;

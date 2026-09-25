@@ -30,6 +30,7 @@ get_io_uring_backend_options() {
         {"expect_serial", ""},
         {"expect_wwid", ""},
         {"buffer_mode", "host"},
+        {"max_dmabuf_bytes", "1073741824"},
     };
     return options;
 }
@@ -45,7 +46,7 @@ createStaticIO_URINGPlugin() {
                                      "IO_URING",
                                      "0.1.0",
                                      get_io_uring_backend_options(),
-                                     {DRAM_SEG, BLK_SEG});
+                                     {DRAM_SEG, VRAM_SEG, BLK_SEG});
 }
 
 #else
@@ -56,7 +57,7 @@ nixl_plugin_init() {
                                      "IO_URING",
                                      "0.1.0",
                                      get_io_uring_backend_options(),
-                                     {DRAM_SEG, BLK_SEG});
+                                     {DRAM_SEG, VRAM_SEG, BLK_SEG});
 }
 
 extern "C" NIXL_PLUGIN_EXPORT void

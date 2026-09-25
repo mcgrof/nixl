@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstring>
 #include <mutex>
+#include <set>
 
 #include <fcntl.h>
 #include <linux/fs.h>
@@ -67,6 +68,43 @@ setDirectAlignments(int fd, const struct stat &st, bool direct, nixlIoUringTarge
         }
     }
 #endif
+}
+
+// Registering a dma-buf rather than host memory needs the extended
+// buffer-update ABI. These mirror include/uapi/linux/io_uring.h because no
+// released kernel or liburing header carries them yet; a kernel without the
+// interface answers the update with -EINVAL, which surfaces from
+// registerDmabuf() and never from a transfer.
+struct nixlUringRsrcUpdate2 {
+    uint32_t offset;
+    uint32_t flags;
+    uint64_t data;
+    uint64_t tags;
+    uint32_t nr;
+    uint32_t resv2;
+};
+
+struct nixlUringRegbufDesc {
+    uint32_t type;
+    uint32_t flags;
+    uint64_t size;
+    uint64_t uaddr;
+    int32_t dmabuf_fd;
+    int32_t target_fd;
+    uint64_t resv[6];
+};
+
+constexpr uint32_t kRsrcUpdateExtended = 1u << 1; // IORING_RSRC_UPDATE_EXTENDED
+constexpr uint32_t kRegbufTypeEmpty = 0; // IO_REGBUF_TYPE_EMPTY
+constexpr uint32_t kRegbufTypeDmabuf = 2; // IO_REGBUF_TYPE_DMABUF
+#ifndef IORING_REGISTER_BUFFERS_UPDATE
+#define IORING_REGISTER_BUFFERS_UPDATE 16
+#endif
+
+int
+uringRegister(int ring_fd, unsigned op, const void *arg, unsigned nr) {
+    const long rc = syscall(__NR_io_uring_register, ring_fd, op, arg, nr);
+    return rc < 0 ? -errno : static_cast<int>(rc);
 }
 
 class nixlIoUringRing final : public nixlIoUringQueue {
@@ -208,14 +246,82 @@ public:
     }
 
     int
+    registerDmabuf(int fd, size_t len, uint32_t &slot) override {
+        // The kernel takes the buffer's length from the dma-buf itself and
+        // validates every request against it, so a caller who registers a
+        // longer window than the dma-buf holds would pass registration and
+        // then fail every transfer with EFAULT. A dma-buf reports its size
+        // through llseek, so check it here instead.
+        const off_t size = ::lseek(fd, 0, SEEK_END);
+        if (size < 0) {
+            NIXL_ERROR << "IO_URING: fd " << fd << " does not report a size: " << strerror(errno)
+                       << "; it is probably not a dma-buf";
+            return -errno;
+        }
+        if (len > static_cast<uint64_t>(size)) {
+            NIXL_ERROR << "IO_URING: a " << len << "-byte registration does not fit the " << size
+                       << "-byte dma-buf on fd " << fd;
+            return -EINVAL;
+        }
+
+        std::lock_guard<std::mutex> guard(slotLock_);
+        int err = takeSlot(slot);
+        if (err) {
+            return err;
+        }
+        // target_fd names the file the buffer will be mapped for, so the
+        // kernel attaches the dma-buf to the device that will DMA to it. This
+        // establishes the I/O context only: the DMA mapping itself is created
+        // lazily by the first request and reused while it stays valid, so the
+        // first request after registering pays for the mapping. The size field
+        // stays zero, and the kernel rejects a registration that sets it: a
+        // dma-buf already knows its own length, and len is only the caller's
+        // view of the range it means to address.
+        nixlUringRegbufDesc desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.type = kRegbufTypeDmabuf;
+        desc.dmabuf_fd = fd;
+        desc.target_fd = fd_;
+        nixlUringRsrcUpdate2 up;
+        memset(&up, 0, sizeof(up));
+        up.offset = slot;
+        up.flags = kRsrcUpdateExtended;
+        up.data = reinterpret_cast<uint64_t>(&desc);
+        up.nr = 1;
+        err = uringRegister(ring_.ring_fd, IORING_REGISTER_BUFFERS_UPDATE, &up, sizeof(up));
+        if (err < 0) {
+            freeSlot(slot);
+            return err;
+        }
+        (void)len;
+        dmabufSlots_.insert(slot);
+        statRegistered_++;
+        return 0;
+    }
+
+    int
     unregisterBuffer(uint32_t slot) override {
         std::lock_guard<std::mutex> guard(slotLock_);
         if (slot >= kSlots || !used_[slot]) {
             return -ENOENT;
         }
-        struct iovec iov = {nullptr, 0};
-        __u64 tag = 0;
-        const int err = io_uring_register_buffers_update_tag(&ring_, slot, &iov, &tag, 1);
+        int err;
+        if (dmabufSlots_.count(slot)) {
+            nixlUringRegbufDesc desc;
+            memset(&desc, 0, sizeof(desc));
+            desc.type = kRegbufTypeEmpty;
+            nixlUringRsrcUpdate2 up;
+            memset(&up, 0, sizeof(up));
+            up.offset = slot;
+            up.flags = kRsrcUpdateExtended;
+            up.data = reinterpret_cast<uint64_t>(&desc);
+            up.nr = 1;
+            err = uringRegister(ring_.ring_fd, IORING_REGISTER_BUFFERS_UPDATE, &up, sizeof(up));
+        } else {
+            struct iovec iov = {nullptr, 0};
+            __u64 tag = 0;
+            err = io_uring_register_buffers_update_tag(&ring_, slot, &iov, &tag, 1);
+        }
 
         // A failed update leaves the old registration installed, and the kernel
         // still holds the buffer. Retire the slot for the life of the ring so a
@@ -223,6 +329,7 @@ public:
         if (err < 0) {
             return err;
         }
+        dmabufSlots_.erase(slot);
         freeSlot(slot);
         return 0;
     }
@@ -339,6 +446,7 @@ private:
     // table needs its own serialization.
     std::mutex slotLock_;
     bool used_[kSlots] = {};
+    std::set<uint32_t> dmabufSlots_;
     nixlIoUringCplCb cplCb_;
     nixlIoUringTarget target_;
     uint64_t statSubmitted_ = 0;
