@@ -119,6 +119,7 @@ Some plugins may have additional build requirements, see them here:
 - [Mooncake](src/plugins/mooncake/README.md)
 - [POSIX](src/plugins/posix/README.md)
 - [GDS](src/plugins/cuda_gds/README.md)
+- [IO_URING](src/plugins/io_uring/README.md)
 
 ## Getting started
 ### Build & install
@@ -181,7 +182,7 @@ $ meson setup build -Drocm_path=/custom/path/to/rocm
 
 **Plugins on ROCm hosts (CUDA toolchain absent):**
 - `UCX` — primary transport for AMD GPU memory (requires UCX built with `--with-rocm`).
-- `POSIX`, `OBJ`, `AZURE_BLOB`, `HF3FS`, `MOONCAKE`, `GUSLI`, `UCCL` — vendor-neutral; build unchanged.
+- `POSIX`, `OBJ`, `AZURE_BLOB`, `HF3FS`, `MOONCAKE`, `GUSLI`, `UCCL`, `IO_URING` — vendor-neutral; build unchanged.
 - `GDS` / `GDS_MT`, `GPUNETIO`, `LIBFABRIC` (with `-DHAVE_CUDA`) — skip automatically because their CUDA / cuFile / DOCA dependencies are not found.
 
 **Known gaps (will be addressed in follow-up PRs):**

@@ -25,6 +25,14 @@ if enabled_plugins.get('POSIX')
     subdir('posix')
 endif
 
+if enabled_plugins.get('IO_URING')
+    if not io_uring_dep.found() and is_explicit_enable
+        error('IO_URING plugin requested but liburing dependency not found')
+    elif io_uring_dep.found()
+        subdir('io_uring')
+    endif
+endif
+
 if enabled_plugins.get('OBJ')
     subdir('obj')
 endif
