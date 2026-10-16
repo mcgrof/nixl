@@ -84,8 +84,13 @@ thing that makes that safe. Omitting both warns.
   dma-buf, so ordinary process memory is not usable on that engine.
 - The target is opened `O_RDWR`, so a read-only device or file cannot be used.
 - A regular file is never extended: the addressable range is whatever the file
-  already holds, so preallocate it. Preallocate *and* initialize it if you
-  intend to read, or a hole will return zeros without reaching the device.
+  already holds, so preallocate it. Initialize every range that will be read,
+  including any consumer warm-up range. With ordinary host buffers, a hole
+  can return zeros without reaching storage. With DMA-BUF buffers, the
+  experimental filesystem path rejects a hole read with `EOPNOTSUPP` because
+  it cannot fill the payload through the CPU.
+- Fixed host registrations count against `RLIMIT_MEMLOCK`; allow enough
+  locked memory for all live registrations.
 - Alignment is enforced from the target's reported direct-I/O alignment even
   when `direct=false`.
 - Progress is driven from `checkXfer()` on the caller's thread. A requested
